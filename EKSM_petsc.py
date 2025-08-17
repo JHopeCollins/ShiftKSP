@@ -39,14 +39,24 @@ amat.assemble()
 ksp = PETSc.KSP().create()
 ksp.setOperators(amat)
 
+if symmetric:
+    ksptype = "cg"
+else:
+    ksptype = "gmres"
 set_from_options(
     ksp, options_prefix="",
     parameters={
-        "ksp_type": "preonly",
-        "pc_type": "lu",
+        "ksp_type": ksptype,
+        "ksp_max_it": 100,
+        "ksp_rtol": 1e-8,
+        "pc_type": "hypre",
         "ksp_reuse_preconditioner": None,
+        "ksp_converged_reason":""
     }
 )
+
+ksprtol = ksp.getTolerances()[0]
+rtol = ksprtol
 
 bvec, xvec = amat.createVecs()
 wvec, yvec = amat.createVecs()
@@ -80,10 +90,6 @@ def dmult(x, y):
         xvec.array[:] = x[:, i]
         bvec.axpy(alpha, xvec)
     return bvec.array_r.copy()
-
-# Factor the matrix A
-lu = splu(A.tocsc())
-dA = LinearOperator(A.shape, matvec=lu.solve)
 
 # Generate Butcher tableau matrix
 order = 8
@@ -124,7 +130,6 @@ ind = 0
 
 for i in range(m_krylov):
     ind += 1
-
     # New basis vector (obtained by mult by A)
     w = amult(V[:, ind])
     h = mdot(V[:, :ind+1], w)
@@ -189,9 +194,11 @@ for i in range(m_krylov):
     #     X[:,k] = V[:,0:temp]@y[0:temp,k]
     #     norms[k] = np.linalg.norm(A@X[:,k]+s[k]*X[:,k]-b.T)/beta
     print(f"max r_{i}: {max(rnorms)[0]:.6e}")
-    if(np.max(rnorms) < 1e-8):
+    if(np.max(rnorms) < rtol):
         break
-
+    maxNormR = np.max(rnorms)
+    ksp.setTolerances(rtol=rtol/maxNormR)
+    
 # Solution recovery    
 X = V[:,:temp]@y
 
