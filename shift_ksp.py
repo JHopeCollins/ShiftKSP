@@ -84,7 +84,7 @@ class ShiftedComplexKSP:
             normw = Ab.norm()
             Ab /= normw
 
-            self.V[:,Voff+1] = Ab.array_r[:]
+            self.V[:,ind+1] = Ab.array_r[:]
             
             self.H[:ind+1, ind] = np.array(h)
             self.H[ind+1, ind] = normw
