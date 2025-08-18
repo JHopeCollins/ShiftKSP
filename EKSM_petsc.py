@@ -1,3 +1,9 @@
+from sys import argv
+import petsctools
+from petsctools import set_from_options, inserted_options
+petsctools.init(argv)
+from petsc4py import PETSc
+
 from math import sqrt, sin, cos, pi
 import numpy as np
 from scipy.sparse import eye, spdiags, kron, csr_matrix
@@ -5,57 +11,10 @@ from scipy.sparse.linalg import splu, LinearOperator, gmres
 from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
 
-from sys import argv
-import petsctools
-from petsctools import set_from_options, inserted_options
-petsctools.init(argv)
-from petsc4py import PETSc
+from eksm import OrthonormalBasis
 
 np.random.seed(6)
 
-def mdot(x, y):
-    n = len(x)
-    r = np.ndarray(n)
-    for i in range(n):
-        r[i] = y.dot(x[i])
-    return r
-
-def dmult(x, y):
-    wrk = x[0].duplicate()
-    wrk.zeroEntries()
-    for i, alpha in enumerate(y):
-        wrk.axpy(alpha, x[i])
-    return wrk
-
-class ExtendedKrylovSpace:
-    def __init__(self, v0, m):
-        self._size = 1
-        self._vectors = tuple(v0.duplicate() for _ in range(2*m+2))
-        v0.copy(self.vectors[0])
-
-    @property
-    def vectors(self):
-        return self._vectors[:self.size]
-
-    @property
-    def size(self):
-        return self._size
-
-    def __getitem__(self, i):
-        return self.vectors[i]
-
-    def add_basis_vector(self, w):
-        self._size += 1
-        V = self.vectors
-        h = mdot(V[:-1], w)
-        w = w - dmult(V[:-1], h)
-        h1 = mdot(V[:-1], w)
-        w = w - dmult(V[:-1], h1)
-        h += h1
-        normw = np.linalg.norm(w)
-        w /= normw
-        w.copy(V[-1])
-        return w, normw, h
 
 # Initialize
 m = 10 # grid size
@@ -118,21 +77,21 @@ beta = norm(b)
 c[0,0] = beta
 w.array[:] = b.flatten()/beta
 
-V = ExtendedKrylovSpace(w, m_krylov)
+V = OrthonormalBasis(w)
 
 # New vector (multiply previous one by A then orthogonalise)
 ksp.solve(V[-1], w)
-w, normwp, hp = V.add_basis_vector(w)
+_, normwp, hp = V.append(w)
 hp = np.append(hp, normwp)
 
 for i in range(m_krylov):
 
     # New basis vector (obtained by mult by A)
     amat.mult(V[-1], w)
-    w, normw, h = V.add_basis_vector(w)
+    _, normw, h = V.append(w)
 
     # Put projection data in H
-    ind = V.size - 2
+    ind = len(V) - 2
     H[:ind+1, ind] = h
     H[ind+1, ind] = normw
 
@@ -144,7 +103,7 @@ for i in range(m_krylov):
 
     # Move on to add next set of basis vectors (obtained by mult by A^-1)
     ksp.solve(V[-1], w)
-    w, normwp, hp = V.add_basis_vector(w)
+    _, normwp, hp = V.append(w)
 
     # Note: The following projection data (hp and normwp) are
     # not ready to be included in H at this stage. It's only
