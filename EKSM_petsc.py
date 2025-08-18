@@ -42,16 +42,26 @@ amat.assemble()
 ksp = PETSc.KSP().create()
 ksp.setOperators(amat)
 
+if symmetric:
+    ksptype = "cg"
+else:
+    ksptype = "gmres"
 set_from_options(
     ksp, options_prefix="",
     parameters={
-        "ksp_type": "preonly",
-        "pc_type": "lu",
+        "ksp_type": ksptype,
+        "ksp_max_it": 100,
+        "ksp_rtol": 1e-8,
+        "ksp_atol": 1e-8,
+        "pc_type": "hypre",
         "ksp_reuse_preconditioner": None,
+        # "ksp_converged_reason": None,
     }
 )
 
 w = amat.createVecRight()
+ksprtol = ksp.getTolerances()[0]
+rtol = ksprtol
 
 # Generate Butcher tableau matrix
 order = 8
@@ -85,7 +95,6 @@ _, normwp, hp = V.append(w)
 hp = np.append(hp, normwp)
 
 for i in range(m_krylov):
-
     # New basis vector (obtained by mult by A)
     amat.mult(V[-1], w)
     _, normw, h = V.append(w)
@@ -127,9 +136,11 @@ for i in range(m_krylov):
         rnorms[k] = norm(r[:,k])/beta
 
     print(f"max r_{i}: {max(rnorms)[0]:.6e}")
-    if(np.max(rnorms) < 1e-8):
+    if(np.max(rnorms) < rtol):
         break
-
+    maxNormR = np.max(rnorms)
+    ksp.setTolerances(rtol=rtol/maxNormR)
+    
 # Solution recovery    
 for i, v in enumerate(V.vectors):
     Varray[:, i] = v.array_r

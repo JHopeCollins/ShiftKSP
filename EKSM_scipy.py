@@ -4,7 +4,6 @@ from scipy.sparse import eye, spdiags, kron
 from scipy.sparse.linalg import splu, LinearOperator, gmres
 from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
-
 np.random.seed(6)
    
 # Initialize

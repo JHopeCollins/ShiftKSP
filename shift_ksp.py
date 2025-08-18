@@ -2,9 +2,7 @@
 def orthogonalise(x, y):
         xty = y.dot(x)
         y -= x*xty
-        ynorm = y.norm()
-        y /= ynorm
-        return y, ynorm, xty
+        return y, xty
     
 
 class ShiftedComplexKSP:
@@ -37,8 +35,11 @@ class ShiftedComplexKSP:
             for _ in range(self.p))
 
         m, n = self.max_it, self.n
-        self.V = np.array((n, 2*m))
-        self.H = np.array((2*m, 2*m-2))
+        self.V = np.array((n, 2*m+2))
+        self.H = np.array((2*m+1, 2*m))
+        self.c = np.array((2*m+1, 1))
+        self.y = np.array((2*m, self.p))
+        self.rnorms = np.zeros((m,p))
 
         self.b = A.createVecLeft()
         self.Ab = A.createVecRight()
@@ -53,54 +54,77 @@ class ShiftedComplexKSP:
 
         # 1a) split b into bi
         b.array[:] = ball.array[:n]
-        bnorm = b.norm()
-        b /= bnorm
+        beta = b.norm()
+        b /= beta
         V[:,0] = b.array_r[:]
-
+        self.c[0,0] = beta
+        
         Aksp.solve(b, Ainvb)
 
-        _, A1bnorm, bA1b = orthogonalise(b, Ainvb)
+        _, hp = orthogonalise(b, Ainvb)
+        normwp = Ainvb.norm()
+        Ainvb /= normwp
 
         V[:,1] = Ainvb.array_r[:]
 
-        norms = [A1bnorm]
-        dots = [bA1b]
-
+        ind = 0
         # 2) loop
         for k in range(self.max_it):
-            Voff = 2*k+1
+            ind += 1
 
             # a) A^k b
-            b.array[:] = V[:,Voff]
+            b.array[:] = V[:,ind]
             self.A.mult(b, Ab)
 
-            for j in range(Voff - 1):
+            h = []
+            for j in range(ind+1):
                 b.array[:] = V[:, j]
-                _, norm, dot = orthogonalise(b, Ab)
-                norms.append(norm)
-                dots.append(dot)
+                _, dot = orthogonalise(b, Ab)
+                h.append(dot)
+            normw = Ab.norm()
+            Ab /= normw
 
-            self.V[:,Voff+1] = Ab.array_r[:]
+            self.V[:,ind+1] = Ab.array_r[:]
+            
+            self.H[:ind+1, ind] = np.array(h)
+            self.H[ind+1, ind] = normw
 
+            self.H[:ind, ind - 1] = -self.H[:ind, :ind - 1] @ hp[:ind - 1]
+            self.H[ind - 1, ind - 1] += 1
+            self.H[:ind + 2, ind - 1] -= np.append(h, normw) * normwp
+            self.H[:ind + 2, ind - 1] /= hp[ind - 1]
+            
             # b) A^-k b
-            Voff += 1
-            b.array[:] = V[:,Voff]
+            ind += 1
+            b.array[:] = V[:,ind]
             self.Aksp.solve(b, Ainvb)
 
-            for j in range(Voff - 1):
+            hp = []
+            for j in range(ind + 1):
                 b.array[:] = V[:, j]
-                _, norm, dot = orthogonalise(b, Ainvb)
-                norms.append(norm)
-                dots.append(dot)
+                _, dot = orthogonalise(b, Ainvb)
+                hp.append(dot)
+            normwp = Ainvb.norm()
+            Ainvb /= normwp
 
-            self.V[:,Voff+1] = Ainvb.array_r[:]
+            self.V[:,ind+1] = Ainvb.array_r[:]
 
-        #   c) H calculation over self.V[:2*k]
-        #   d) residual estimation
+            #   d) residual estimation
+            temp = 2*k+2
+            self.y[:temp,:] = scipy.linalg.solve_sylvester(self.H[:temp,:temp], 
+                                self.S,
+                                np.outer(self.c[:temp],np.ones(p)))
+            r = self.H[temp:temp+self.p,:temp] @ self.y[:temp,:]
+        
+            for j in range(self.p):
+                self.rnorms[k,j] = np.linalg.norm(r[:,j])
+            
         #   e) monitors & convergence test
 
         # 3) reassemble x from xi
+        
         for i in range(p):
+            self.xs[i].array[:] = self.V[:,:temp]@ self.y[:temp,i]
             x.array[i*n:(i+1)*n] = self.xs[i].array[:]
 
 
