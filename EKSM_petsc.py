@@ -1,7 +1,5 @@
-from sys import argv
-import petsctools
-from petsctools import set_from_options, inserted_options
-petsctools.init(argv)
+from petsctools import init as petsc_init, set_from_options, inserted_options
+petsc_init()
 from petsc4py import PETSc
 
 from math import sqrt, sin, cos, pi
@@ -14,7 +12,6 @@ import butchertableau as bt
 from eksm import OrthonormalBasis
 
 np.random.seed(6)
-
 
 # Initialize
 m = 10 # grid size

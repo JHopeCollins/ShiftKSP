@@ -1,11 +1,14 @@
-from numpy import ndarray
+import numpy as np
+from scipy.linalg import solve_sylvester, norm
+from petsctools import set_from_options, inserted_options
+from petsc4py import PETSc
 
-__all__ = ["OrthonormalBasis"]
+__all__ = ["OrthonormalBasis", "eksm", "KroneckerProductMat"]
 
 
 def mdot(x, y):
     n = len(x)
-    r = ndarray(n)
+    r = np.ndarray(n)
     for i in range(n):
         r[i] = y.dot(x[i])
     return r
@@ -102,15 +105,134 @@ class KroneckerProductMat:
         self.S = S
 
         Ia = PETSc.Mat().createConstantDiagonal(
-            size=A.sizes, diag=1, comm = A.comm)
+            size=A.sizes, diag=1.0, comm=A.comm)
+        Ia.convert(PETSc.Mat.Type.AIJ)
 
         Is = PETSc.Mat().createConstantDiagonal(
-            size=S.sizes, diag=1, comm = S.comm)
+            size=S.sizes, diag=1.0, comm=S.comm)
+        Is.convert(PETSc.Mat.Type.AIJ)
 
-        IA = Ia.kron(A)
-        SI = S.kron(Is)
+        self.IA = Is.kron(A)
+        self.SI = S.kron(Ia)
 
-        self.kronecker_mat = IA + SI
+        self.wa, self.ws = self.IA.createVecs()
+
+        self.vec_nest = PETSc.Vec().createNest(
+            vecs=[A.createVecRight()
+                  for _ in range(S.sizes[0][0])],
+            comm=A.comm
+        )
 
     def mult(self, pc, x, y):
-        self.kronecker_mat.mult(x, y)
+        wa, ws = self.wa, self.ws
+        w = y.duplicate()
+        self.IA.mult(x, wa)
+        self.SI.mult(x, ws)
+        w = wa + ws
+        w.copy(y)
+
+
+def eksm(mat_kron, b, parameters=None, options_prefix="", max_it=100):
+    kctx = mat_kron.getPythonContext()
+    amat = kctx.A
+    smat = kctx.S
+
+    b_nest = kctx.vec_nest.duplicate()
+    b.copy(b_nest)
+    b0 = b_nest.getNestSubVecs()[0]
+
+    ksp = PETSc.KSP().create()
+    ksp.setOperators(amat)
+    set_from_options(
+        ksp, options_prefix=options_prefix,
+        parameters=parameters
+    )
+
+    smat.convert(PETSc.Mat.Type.DENSE)
+    S = smat.getDenseArray(readonly=True)
+    smat.convert(PETSc.Mat.Type.AIJ)
+
+    p = S.shape[0]
+    n = amat.sizes[0][0]
+
+    w = amat.createVecRight()
+    ksprtol = ksp.getTolerances()[0]
+    rtol = ksprtol
+
+    # Set Extended Krylov space quantities
+    m_krylov = max_it # maximum iteration count
+    X = np.zeros((n,p)) # solution matrix
+    Varray = np.zeros((n, 2 * m_krylov + 2)) # matrix holding basis vectors
+    H = np.zeros((2 * m_krylov + 1, 2 * m_krylov)) # to hold projected problem
+    c = np.zeros((2 * m_krylov + 1, 1)) # projected rhs
+    y = np.zeros((2 * m_krylov, p)) # projected solution
+
+    # First basis vector (orthogonalised rhs)
+    beta = b0.norm()
+    b0.copy(w)
+    w /= beta
+    c[0,0] = beta
+
+    V = OrthonormalBasis(w)
+
+    # New vector (multiply previous one by A^{-1} then orthogonalise)
+    with inserted_options(ksp):
+        ksp.solve(V[-1], w)
+    _, normwp, hp = V.append(w)
+    hp = np.append(hp, normwp)
+
+    for i in range(m_krylov):
+        # New basis vector (obtained by mult by A)
+        amat.mult(V[-1], w)
+        _, normw, h = V.append(w)
+
+        # Put projection data in H
+        ind = len(V) - 2
+        H[:ind+1, ind] = h
+        H[ind+1, ind] = normw
+
+        # Put projection data for previous set, see note below
+        H[:ind, ind - 1] = -H[:ind, :ind - 1] @ hp[:ind - 1]
+        H[ind - 1, ind - 1] += 1
+        H[:ind + 2, ind - 1] -= np.append(h, normw) * normwp
+        H[:ind + 2, ind - 1] /= hp[ind - 1]
+
+        # Move on to add next set of basis vectors (obtained by mult by A^-1)
+        with inserted_options(ksp):
+            ksp.solve(V[-1], w)
+        _, normwp, hp = V.append(w)
+
+        # Note: The following projection data (hp and normwp) are
+        # not ready to be included in H at this stage. It's only
+        # possible to add them into H once we multiply the
+        # corresponding set of vectors by A and use the new
+        # projection data to make the Krylov projection relation
+        # hold.
+        # Hence, at this stage of the process, the relation that
+        # hold is valid up to the so far constructed basis, that
+        # is:
+        #  A V[:,:2*i*p] = V[:,2*i*p+p] H[:2*i*p+p,2*i*p]
+
+        # Solve projected problem
+        temp = 2*i+2
+        y = solve_sylvester(
+            H[:temp, :temp], S,
+            np.outer(c[:temp], np.ones(p)))
+
+        # Check residual norm
+        r = H[temp:temp+p, :temp] @ y
+        rnorms = np.zeros((p,1))
+        for k in range(p):
+            rnorms[k] = norm(r[:, k])/beta
+
+        print(f"max r_{i}: {max(rnorms)[0]:.6e}")
+        if(np.max(rnorms) < rtol):
+            break
+        maxNormR = np.max(rnorms)
+        ksp.setTolerances(rtol=rtol/maxNormR)
+
+    # Solution recovery
+    for i, v in enumerate(V.vectors):
+        Varray[:, i] = v.array_r
+    X = Varray[:,:temp]@y
+    return X

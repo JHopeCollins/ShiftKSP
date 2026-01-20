@@ -1,20 +1,23 @@
+from math import sqrt, sin, cos, pi
 import numpy as np
 from scipy.sparse import eye, spdiags, kron
 from scipy.sparse.linalg import splu, LinearOperator, gmres
 from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
-
    
 # Initialize
-m = 100 # grid size
+m = 10 # grid size
 n = m * m # number of unknowns
-symmetric = False
+symmetric = True
+re = 10
+angle = pi/3
 I = eye(m)
 L = spdiags([[1]*m, [-1]*m], [0, 1], m, m)
 D = spdiags([[-1]*m, [2]*m, [-1]*m], [-1,0,1], m, m)
-A =  (m+1)**2 * (kron(D,I) + kron(I,D))
+A =  (1/re)*(m+1)**2 * (kron(D,I) + kron(I,D))
 if not symmetric:
-    A +=  (m+1) * (kron(L,I))
+    A +=  (m+1) * (cos(angle)*kron(L,I) + sin(angle)*kron(I,L))
+A += eye(n)
 
 # Factor the matrix A
 lu = splu(A.tocsc())
@@ -26,7 +29,7 @@ tableau = bt.butcher(order, 15)
 S, _, _ = tableau.radau() 
 Sinv = np.array(tableau.inv(S),np.float64)
 p = Sinv.shape[0]
-print("Sinv",Sinv)
+# print(f"{Sinv = }")
 
 # Create rhs matrix
 b = np.random.randn(n, 1)
@@ -123,7 +126,7 @@ for i in range(m_krylov):
     #         y[0:temp,k] = np.linalg.solve(VtAV,c[0:temp,0])
     #     X[:,k] = V[:,0:temp]@y[0:temp,k]
     #     norms[k] = np.linalg.norm(A@X[:,k]+s[k]*X[:,k]-b.T)/beta
-    print("max r_",i, ":", max(rnorms))
+    print(f"max r_{i}: {max(rnorms)[0]:.8e}")
     if(np.max(rnorms) < 1e-8):
         break
 
@@ -135,5 +138,5 @@ norms = np.zeros((p,1))
 R = A@X+X@Sinv
 for k in range(p):
     norms[k] = np.linalg.norm(b.T-R[:,k])/beta
-print("Maximum of true residual norms:", max(np.abs(norms)))
+print(f"Maximum of true residual norms: {max(np.abs(norms))[0]:.8e}")
 
