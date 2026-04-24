@@ -140,7 +140,7 @@ class KroneckerProductMat:
         yn.copy(result=y)
 
 
-def eksm(kronmat, Aksp, b, m_krylov, rtol):
+def eksm(kronmat, Aksp, b, d, m_krylov, rtol):
     kronctx = kronmat.getPythonContext()
     amat, smat = kronctx.A, kronctx.S
 
@@ -173,6 +173,7 @@ def eksm(kronmat, Aksp, b, m_krylov, rtol):
     _, normwp, hp = V.append(w)
     hp = np.append(hp, normwp)
 
+    Aksprtol = Aksp.rtol
     for i in range(m_krylov):
         # New basis vector (obtained by mult by A)
         amat.mult(V[-1], w)
@@ -209,20 +210,20 @@ def eksm(kronmat, Aksp, b, m_krylov, rtol):
         temp = 2*i+2
         y = solve_sylvester(
             H[:temp,:temp], S,
-            np.outer(c[:temp], np.ones(p)))
+            np.outer(c[:temp], d.array_r[:p]))
 
         # Check residual norm
-        r = H[temp:temp+p,:temp] @ y
+        r = H[temp:temp+1,:temp] @ y
         rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:,k])/beta
+            rnorms[k] = norm(r[:,k]) / ((np.abs(d.array_r[k])+2*np.finfo(d.array_r[k]).eps) * beta)
 
         print(f"max r_{i}: {max(rnorms)[0]:.6e}")
         if(np.max(rnorms) < rtol):
             break
         if PETSc.Options().getBool("adaptive_rtol", False):
             maxNormR = np.max(rnorms)
-            Aksp.setTolerances(rtol=min(Aksp.rtol/maxNormR, 0.1))
+            Aksp.setTolerances(rtol=min(Aksprtol/maxNormR, 0.1))
 
     # Solution recovery
     for i, v in enumerate(V.vectors):
