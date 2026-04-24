@@ -9,11 +9,10 @@ def Amat(m, re, angle=pi/3, symmetric=True, petsc=False):
     I = eye(m)
     L = spdiags([[1]*m, [-1]*m], [0, 1], m, m)
     D = spdiags([[-1]*m, [2]*m, [-1]*m], [-1,0,1], m, m)
-    A =  (1/re)*(m+1)**2 * (kron(D,I) + kron(I,D))
-
+    A =  ((m+1)**2) * (kron(D,I) + kron(I,D))/re
     if not symmetric:
         A +=  (m+1) * (cos(angle)*kron(L,I) + sin(angle)*kron(I,L))
-    A += eye(n)
+    # A += eye(n)
 
     if petsc:
         sizes = (n, n)
