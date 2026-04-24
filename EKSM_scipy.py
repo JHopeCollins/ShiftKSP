@@ -4,44 +4,43 @@ from scipy.sparse import eye, spdiags, kron
 from scipy.sparse.linalg import splu, LinearOperator, gmres
 from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
+
+from problem import Amat, Smat
+
 np.random.seed(6)
-   
+
+rtol = 1e-8
+
 # Initialize
 m = 10 # grid size
-n = m * m # number of unknowns
 symmetric = True
 re = 10
 angle = pi/3
-I = eye(m)
-L = spdiags([[1]*m, [-1]*m], [0, 1], m, m)
-D = spdiags([[-1]*m, [2]*m, [-1]*m], [-1,0,1], m, m)
-A =  (1/re)*(m+1)**2 * (kron(D,I) + kron(I,D))
-if not symmetric:
-    A +=  (m+1) * (cos(angle)*kron(L,I) + sin(angle)*kron(I,L))
-A += eye(n)
+order = 8
+m_krylov = 160 # maximum iteration count
+
+n = m * m # number of unknowns
+
+# Block matrix
+A = Amat(m, re, angle=angle, symmetric=symmetric)
+
+# Butcher tableau matrix
+S, Sinv = Smat(order)
+p = Sinv.shape[0]
 
 # Factor the matrix A
 lu = splu(A.tocsc())
 dA = LinearOperator(A.shape, matvec=lu.solve)
 
-# Generate Butcher tableau matrix
-order = 8
-tableau = bt.butcher(order, 15)
-S, _, _ = tableau.radau() 
-Sinv = np.array(tableau.inv(S),np.float64)
-p = Sinv.shape[0]
-# print(f"{Sinv = }")
-
-# Create rhs matrix
-b = np.random.randn(n, 1)
-
 # Set Extended Krylov space quantities
-m_krylov = 160 # maximum iteration count
 X = np.zeros((n,p)) # solution matrix
 V = np.zeros((n, 2 * m_krylov + 2)) # matrix holding basis vectors
 H = np.zeros((2 * m_krylov + 1, 2 * m_krylov)) # to hold projected problem
 c = np.zeros((2 * m_krylov + 1, 1)) # projected rhs
 y = np.zeros((2 * m_krylov, p)) # projected solution
+
+# Create rhs matrix
+b = np.random.randn(n, 1)
 
 # First basis vector (orthogonalised rhs)
 beta = norm(b)
@@ -128,7 +127,7 @@ for i in range(m_krylov):
     #     X[:,k] = V[:,0:temp]@y[0:temp,k]
     #     norms[k] = np.linalg.norm(A@X[:,k]+s[k]*X[:,k]-b.T)/beta
     print(f"max r_{i}: {max(rnorms)[0]:.6e}")
-    if(np.max(rnorms) < 1e-8):
+    if(np.max(rnorms) < rtol):
         break
 
 # Solution recovery    

@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.linalg import solve_sylvester, norm
-from petsctools import set_from_options, inserted_options
+import petsctools
 from petsc4py import PETSc
 
 __all__ = ["OrthonormalBasis", "eksm", "KroneckerProductMat"]
@@ -100,22 +100,15 @@ class OrthonormalBasis:
 
 
 class KroneckerProductMat:
+    """Apply: S*I_{a} + I_{s}*A  (* is kronecker product)
+    """
     def __init__(self, A, S):
         self.A = A
         self.S = S
 
-        Ia = PETSc.Mat().createConstantDiagonal(
-            size=A.sizes, diag=1.0, comm=A.comm)
-        Ia.convert(PETSc.Mat.Type.AIJ)
-
-        Is = PETSc.Mat().createConstantDiagonal(
-            size=S.sizes, diag=1.0, comm=S.comm)
-        Is.convert(PETSc.Mat.Type.AIJ)
-
-        self.IA = Is.kron(A)
-        self.SI = S.kron(Ia)
-
-        self.wa, self.ws = self.IA.createVecs()
+        self.S.convert(PETSc.Mat.Type.DENSE)
+        self.Sa = S.getDenseArray(readonly=True).copy()
+        self.S.convert(PETSc.Mat.Type.AIJ)
 
         self.vec_nest = PETSc.Vec().createNest(
             vecs=[A.createVecRight()
@@ -123,44 +116,43 @@ class KroneckerProductMat:
             comm=A.comm
         )
 
-    def mult(self, pc, x, y):
-        wa, ws = self.wa, self.ws
-        w = y.duplicate()
-        self.IA.mult(x, wa)
-        self.SI.mult(x, ws)
-        w = wa + ws
-        w.copy(y)
+    def mult(self, mat, x, y):
+        xn = self.vec_nest.duplicate()
+        yn = self.vec_nest.duplicate()
+        w = self.A.createVecRight()
+
+        x.copy(result=xn)
+        y.zeroEntries()
+
+        xsubs = xn.getNestSubVecs()
+        ysubs = yn.getNestSubVecs()
+        Sa = self.Sa
+
+        for i in range(Sa.shape[0]):
+            xi = xsubs[i]
+            yi = ysubs[i]
+            self.A.mult(xi, w)
+            yi += w
+            for j in range(Sa.shape[1]):
+                yi += float(Sa[j, i])*xsubs[j]
+
+        yn.setNestSubVecs(ysubs)
+        yn.copy(result=y)
 
 
-def eksm(mat_kron, b, parameters=None, options_prefix="", max_it=100):
-    kctx = mat_kron.getPythonContext()
-    amat = kctx.A
-    smat = kctx.S
+def eksm(kronmat, Aksp, b, m_krylov, rtol):
+    kronctx = kronmat.getPythonContext()
+    amat, smat = kronctx.A, kronctx.S
 
-    b_nest = kctx.vec_nest.duplicate()
-    b.copy(b_nest)
-    b0 = b_nest.getNestSubVecs()[0]
+    n = amat.size[0]
+    p = smat.size[0]
 
-    ksp = PETSc.KSP().create()
-    ksp.setOperators(amat)
-    set_from_options(
-        ksp, options_prefix=options_prefix,
-        parameters=parameters
-    )
-
+    # extract dense numpy array for S
     smat.convert(PETSc.Mat.Type.DENSE)
-    S = smat.getDenseArray(readonly=True)
+    S = smat.getDenseArray(readonly=True).copy()
     smat.convert(PETSc.Mat.Type.AIJ)
 
-    p = S.shape[0]
-    n = amat.sizes[0][0]
-
-    w = amat.createVecRight()
-    ksprtol = ksp.getTolerances()[0]
-    rtol = ksprtol
-
     # Set Extended Krylov space quantities
-    m_krylov = max_it # maximum iteration count
     X = np.zeros((n,p)) # solution matrix
     Varray = np.zeros((n, 2 * m_krylov + 2)) # matrix holding basis vectors
     H = np.zeros((2 * m_krylov + 1, 2 * m_krylov)) # to hold projected problem
@@ -168,16 +160,16 @@ def eksm(mat_kron, b, parameters=None, options_prefix="", max_it=100):
     y = np.zeros((2 * m_krylov, p)) # projected solution
 
     # First basis vector (orthogonalised rhs)
-    beta = b0.norm()
-    b0.copy(w)
-    w /= beta
+    beta = b.norm()
     c[0,0] = beta
+    w = b.copy()
+    w /= beta
 
     V = OrthonormalBasis(w)
 
-    # New vector (multiply previous one by A^{-1} then orthogonalise)
-    with inserted_options(ksp):
-        ksp.solve(V[-1], w)
+    # New vector (multiply previous one by A then orthogonalise)
+    with petsctools.inserted_options(Aksp):
+        Aksp.solve(V[-1], w)
     _, normwp, hp = V.append(w)
     hp = np.append(hp, normwp)
 
@@ -198,8 +190,8 @@ def eksm(mat_kron, b, parameters=None, options_prefix="", max_it=100):
         H[:ind + 2, ind - 1] /= hp[ind - 1]
 
         # Move on to add next set of basis vectors (obtained by mult by A^-1)
-        with inserted_options(ksp):
-            ksp.solve(V[-1], w)
+        with petsctools.inserted_options(Aksp):
+            Aksp.solve(V[-1], w)
         _, normwp, hp = V.append(w)
 
         # Note: The following projection data (hp and normwp) are
@@ -216,23 +208,59 @@ def eksm(mat_kron, b, parameters=None, options_prefix="", max_it=100):
         # Solve projected problem
         temp = 2*i+2
         y = solve_sylvester(
-            H[:temp, :temp], S,
+            H[:temp,:temp], S,
             np.outer(c[:temp], np.ones(p)))
 
         # Check residual norm
-        r = H[temp:temp+p, :temp] @ y
+        r = H[temp:temp+p,:temp] @ y
         rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:, k])/beta
+            rnorms[k] = norm(r[:,k])/beta
 
         print(f"max r_{i}: {max(rnorms)[0]:.6e}")
         if(np.max(rnorms) < rtol):
             break
-        maxNormR = np.max(rnorms)
-        ksp.setTolerances(rtol=rtol/maxNormR)
+        if PETSc.Options().getBool("adaptive_rtol", False):
+            maxNormR = np.max(rnorms)
+            Aksp.setTolerances(rtol=min(Aksp.rtol/maxNormR, 0.1))
 
     # Solution recovery
     for i, v in enumerate(V.vectors):
         Varray[:, i] = v.array_r
     X = Varray[:,:temp]@y
     return X
+
+
+class ShiftedExtendedKSP:
+    """Solve: S*I_{a} + I_{s}*A  (* is kronecker product)
+    """
+
+    prefix = "shift_"
+
+    def setUp(self, ksp, b, x):
+        Akron, Pkron = ksp.getOperators()
+
+        A = Akron.getMat(0, 1)
+        S = Akron.getMat(1, 0)
+
+        self.n, _ = A.getSizes()
+        self.p, _ = S.getSizes()
+
+        self.s = S.getDiagonal().array_r
+
+        Ap = Pkron.getMat(0, 1)
+
+        prefix = ksp.getOptionsPrefix() or ""
+        self.Aksp = PETSc.KSP().create()
+        self.Aksp.setOperators(A, Ap)
+        self.Aksp.setPrefix(prefix+self.prefix)
+        self.Aksp.setFromOptions()
+        self.Aksp.setUp()
+
+        self.adaptive_rtol = PETSc.Options().getBool(
+            f"{prefix}ksp_{self.prefix}adaptive_rtol")
+
+    def solve(self, ksp, b, x):
+
+        X = eksm(self.P, self.Aksp, b,
+                 ksp.max_it, ksp.rtol)

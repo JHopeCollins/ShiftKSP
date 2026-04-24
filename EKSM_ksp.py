@@ -1,126 +1,119 @@
-from petsctools import init as petsc_init, set_from_options
-petsc_init()
-from petsc4py import PETSc
+import petsctools
+PETSc = petsctools.init()
 
 from math import sqrt, sin, cos, pi
 import numpy as np
 from scipy.sparse import eye, spdiags, kron, csr_matrix
 from scipy.sparse.linalg import splu, LinearOperator, gmres
+from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
 
 from eksm import eksm, KroneckerProductMat
+from problem import Amat, Smat
 
 np.random.seed(6)
 
+rtol = 1e-8
+
 # Initialize
 m = 10 # grid size
-n = m * m # number of unknowns
 symmetric = True
 re = 10
 angle = pi/3
-I = eye(m)
-L = spdiags([[1]*m, [-1]*m], [0, 1], m, m)
-D = spdiags([[-1]*m, [2]*m, [-1]*m], [-1,0,1], m, m)
-A =  (1/re)*(m+1)**2 * (kron(D,I) + kron(I,D))
-if not symmetric:
-    A +=  (m+1) * (cos(angle)*kron(L,I) + sin(angle)*kron(I,L))
-A += eye(n)
-
-sizes = (n, n)
-amat = PETSc.Mat().createAIJ(
-    size=(sizes, sizes),
-    csr=(A.indptr, A.indices)
-)
-amat.setUp()
-amat.setValuesCSR(A.indptr, A.indices, A.data)
-amat.assemble()
-
-# Generate Butcher tableau matrix
 order = 8
-tableau = bt.butcher(order, 15)
-S, _, _ = tableau.radau() 
-Sinv = np.array(tableau.inv(S),np.float64)
+m_krylov = 160 # maximum iteration count
+
+n = m * m # number of unknowns
+
+# Block matrix
+A, amat = Amat(m, re, angle=angle, symmetric=symmetric, petsc=True)
+
+# Butcher tableau matrix
+S, Sinv = Smat(order)
 p = Sinv.shape[0]
 
-smat = PETSc.Mat().createDense(
+sinv = PETSc.Mat().createDense(
     size=((p, p), (p, p)),
     array=Sinv
 )
+sinv.convert(PETSc.Mat.Type.AIJ)
+sinv.setUp()
+sinv.assemble()
 
-sarray_r = smat.getDenseArray(readonly=True)
-smat.convert(PETSc.Mat.Type.AIJ)
+ksp = PETSc.KSP().create()
+ksp.setOperators(amat)
 
-assert sarray_r.shape == Sinv.shape
-assert np.allclose(sarray_r, Sinv)
-
-parameters={
-    "ksp_type": "cg" if symmetric else "gmres",
-    "ksp_max_it": 100,
-    "ksp_rtol": 1e-8,
-    "ksp_atol": 1e-8,
-    "pc_type": "hypre",
-    "ksp_reuse_preconditioner": None,
-    # "ksp_converged_reason": None,
-}
-
-N = n*p
-mat_kron = PETSc.Mat().createPython(
-    size=((N, N), (N, N)),
-    context=KroneckerProductMat(amat, smat)
-)
-
-# Create rhs matrix
-b0 = amat.createVecRight()
-b0.array[:] = np.random.randn(n, 1).flatten()
-beta = b0.norm()
-
-b, x = mat_kron.createVecs()
-b.zeroEntries()
-b.array[:n] = b0.array
-
-X = eksm(mat_kron, b, parameters, max_it=100)
-
-ksp_kron = PETSc.KSP().create()
-ksp_kron.setOperators(mat_kron)
-set_from_options(
-    ksp_kron, options_prefix="kron",
+petsctools.set_from_options(
+    ksp, options_prefix="",
     parameters={
-        "ksp_monitor": None,
-        "ksp_converged_reason": None,
-        "ksp_rtol": 1e-8,
-        "ksp_type": "gmres",
-        "pc_type": "none",
-
-        # "ksp_type": "python",
-        # "ksp_python_type": "eksm.ShiftedComplexKSP",
-        # "ksp_max_it": 160,
-        # "ksp_rtol": 1e-8,
-        # "sub": {
-        #     "ksp_reuse_preconditioner": None,
-        #     "ksp_max_it": 100,
-        #     "ksp_rtol": 1e-8,
-        #     "ksp_atol": 1e-8,
-        #     "ksp_type": "cg" if symmetric else "gmres",
-        #     "pc_type": "hypre",
-        # }
+        "ksp_type": "cg" if symmetric else "gmres",
+        "ksp_max_it": 100,
+        "ksp_rtol": 1e-10,
+        "pc_type": "hypre",
+        "ksp_reuse_preconditioner": None,
+        # "ksp_converged_reason": None,
     }
 )
-# ksp_kron.solve(b, x)
-Xkron = np.empty_like(X)
-xr = x.array_r.reshape(p, n)
-for k in range(p):
-    Xkron[:, k] = xr[k, :]
+
+# Create single rhs data
+bdata = np.random.randn(n, 1)
+
+# rhs vector
+b = amat.createVecRight()
+b.array[:] = bdata.flatten()
+
+kronmat = PETSc.Mat().createPython(
+    size=((n*p, n*p), (n*p, n*p)),
+    context=KroneckerProductMat(amat, sinv),
+)
+kronmat.setUp()
+kronmat.assemble()
+
+X = eksm(kronmat, ksp, b, m_krylov, rtol)
 
 # Check true residual norms
 norms = np.zeros((p,1))
 R = A@X+X@Sinv
+beta = norm(b)
 for k in range(p):
-    norms[k] = np.linalg.norm(b0.array_r.T-R[:,k])/beta
-print(f"Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+    norms[k] = np.linalg.norm(bdata.T-R[:,k])/beta
+print(f"eksm: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+print(f"eksm: True residual norms:\n{np.abs(norms)}")
 
-norms = np.zeros((p,1))
+# KSP for the full kronecker matrix
+kronksp = PETSc.KSP().create()
+kronksp.setOperators(kronmat)
+petsctools.set_from_options(
+    kronksp, options_prefix="kron",
+    parameters={
+        "ksp_converged_reason": None,
+        "ksp_rtol": rtol,
+        "ksp_type": "gmres",
+        "pc_type": "none",
+    }
+)
+bfull = kronmat.getPythonContext().vec_nest.duplicate()
+xfull = kronmat.getPythonContext().vec_nest.duplicate()
+
+# duplicate b into all blocks of the full rhs
+bsubs = bfull.getNestSubVecs()
+for bi in bsubs:
+    b.copy(result=bi)
+bfull.setNestSubVecs(bsubs)
+
+with petsctools.inserted_options(kronksp):
+    kronksp.solve(bfull, xfull)
+
+# extract solution for each block
+Xkron = np.empty_like(X)
+xsubs = xfull.getNestSubVecs()
+for i, xi in enumerate(xsubs):
+    Xkron[:, i] = xi.array_r
+
 R = A@Xkron+Xkron@Sinv
+beta = norm(b)
 for k in range(p):
-    norms[k] = np.linalg.norm(b0.array_r.T-R[:,k])/beta
-print(f"Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+    norms[k] = np.linalg.norm(bdata.T-R[:,k])/beta
 
+print(f"ksp: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+print(f"ksp: True residual norms:\n{np.abs(norms)}")

@@ -1,52 +1,48 @@
-from petsctools import init as petsc_init, set_from_options, inserted_options
-petsc_init()
-from petsc4py import PETSc
+import petsctools
+PETSc = petsctools.init()
 
-from math import sqrt, sin, cos, pi
+from math import pi
 import numpy as np
-from scipy.sparse import eye, spdiags, kron, csr_matrix
-from scipy.sparse.linalg import splu, LinearOperator, gmres
 from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
 
 from eksm import OrthonormalBasis
+from problem import Amat, Smat
 
 np.random.seed(6)
 
+rtol = 1e-8
+
 # Initialize
 m = 10 # grid size
-n = m * m # number of unknowns
 symmetric = True
 re = 10
 angle = pi/3
-I = eye(m)
-L = spdiags([[1]*m, [-1]*m], [0, 1], m, m)
-D = spdiags([[-1]*m, [2]*m, [-1]*m], [-1,0,1], m, m)
-A =  (1/re)*(m+1)**2 * (kron(D,I) + kron(I,D))
-if not symmetric:
-    A +=  (m+1) * (cos(angle)*kron(L,I) + sin(angle)*kron(I,L))
-A += eye(n)
+order = 8
+m_krylov = 160 # maximum iteration count
 
-sizes = (n, n)
-amat = PETSc.Mat().createAIJ(
-    size=(sizes, sizes),
-    csr=(A.indptr, A.indices)
+n = m * m # number of unknowns
+
+# Block matrix
+A, amat = Amat(m, re, angle=angle, symmetric=symmetric, petsc=True)
+
+# Butcher tableau matrix
+S, Sinv = Smat(order)
+p = Sinv.shape[0]
+
+smat = PETSc.Mat().createDense(
+    size=((p, p), (p, p)),
+    array=Sinv
 )
-amat.setUp()
-amat.setValuesCSR(A.indptr, A.indices, A.data)
-amat.assemble()
+smat.convert(PETSc.Mat.Type.AIJ)
 
 ksp = PETSc.KSP().create()
 ksp.setOperators(amat)
 
-if symmetric:
-    ksptype = "cg"
-else:
-    ksptype = "gmres"
-set_from_options(
+petsctools.set_from_options(
     ksp, options_prefix="",
     parameters={
-        "ksp_type": ksptype,
+        "ksp_type": "cg" if symmetric else "gmres",
         "ksp_max_it": 100,
         "ksp_rtol": 1e-8,
         "ksp_atol": 1e-8,
@@ -58,26 +54,19 @@ set_from_options(
 
 w = amat.createVecRight()
 ksprtol = ksp.getTolerances()[0]
-rtol = ksprtol
-
-# Generate Butcher tableau matrix
-order = 8
-tableau = bt.butcher(order, 15)
-S, _, _ = tableau.radau() 
-Sinv = np.array(tableau.inv(S),np.float64)
-p = Sinv.shape[0]
-
 
 # Set Extended Krylov space quantities
-m_krylov = 160 # maximum iteration count
 X = np.zeros((n,p)) # solution matrix
 Varray = np.zeros((n, 2 * m_krylov + 2)) # matrix holding basis vectors
 H = np.zeros((2 * m_krylov + 1, 2 * m_krylov)) # to hold projected problem
 c = np.zeros((2 * m_krylov + 1, 1)) # projected rhs
 y = np.zeros((2 * m_krylov, p)) # projected solution
 
-# Create rhs matrix
-b = np.random.randn(n, 1)
+# Create single rhs data
+bdata = np.random.randn(n, 1)
+
+# rhs vector
+b = bdata
 
 # First basis vector (orthogonalised rhs)
 beta = norm(b)
@@ -87,7 +76,8 @@ w.array[:] = b.flatten()/beta
 V = OrthonormalBasis(w)
 
 # New vector (multiply previous one by A then orthogonalise)
-ksp.solve(V[-1], w)
+with petsctools.inserted_options(ksp):
+    ksp.solve(V[-1], w)
 _, normwp, hp = V.append(w)
 hp = np.append(hp, normwp)
 
@@ -108,7 +98,8 @@ for i in range(m_krylov):
     H[:ind + 2, ind - 1] /= hp[ind - 1]
 
     # Move on to add next set of basis vectors (obtained by mult by A^-1)
-    ksp.solve(V[-1], w)
+    with petsctools.inserted_options(ksp):
+        ksp.solve(V[-1], w)
     _, normwp, hp = V.append(w)
 
     # Note: The following projection data (hp and normwp) are
@@ -124,7 +115,9 @@ for i in range(m_krylov):
     
     # Solve projected problem
     temp = 2*i+2
-    y = solve_sylvester(H[:temp,:temp],Sinv,np.outer(c[:temp],np.ones(p)))
+    y = solve_sylvester(
+        H[:temp,:temp], Sinv,
+        np.outer(c[:temp], np.ones(p)))
     
     # Check residual norm
     r = H[temp:temp+p,:temp] @ y
@@ -135,8 +128,9 @@ for i in range(m_krylov):
     print(f"max r_{i}: {max(rnorms)[0]:.6e}")
     if(np.max(rnorms) < rtol):
         break
-    maxNormR = np.max(rnorms)
-    ksp.setTolerances(rtol=rtol/maxNormR)
+    if PETSc.Options().getBool("adaptive_rtol", False):
+        maxNormR = np.max(rnorms)
+        ksp.setTolerances(rtol=min(ksp.rtol/maxNormR, 0.1))
     
 # Solution recovery    
 for i, v in enumerate(V.vectors):
@@ -147,6 +141,7 @@ X = Varray[:,:temp]@y
 norms = np.zeros((p,1))
 R = A@X+X@Sinv
 for k in range(p):
-    norms[k] = np.linalg.norm(b.T-R[:,k])/beta
+    norms[k] = np.linalg.norm(bdata.T-R[:,k])/beta
 print(f"Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+print(f"True residual norms:\n{np.abs(norms)}")
 
