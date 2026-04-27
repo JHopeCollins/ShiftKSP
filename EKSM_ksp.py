@@ -13,15 +13,16 @@ from problem import Amat, Smat
 
 np.random.seed(6)
 
-rtol = 1e-8
+options = PETSc.Options()
 
-# Initialize
-m = 10 # grid size
-symmetric = True
-re = 10
-angle = pi/3
-order = 8
-m_krylov = 160 # maximum iteration count
+atol = options.getReal("atol", 1e-8)
+m = options.getInt("nx", 10)
+symmetric = options.getBool("symmetric", True)
+re = options.getReal("re", 10)
+angle = options.getReal("angle", pi/3)
+order = options.getInt("order", 8)
+max_it = options.getInt("max_it", 100) # maximum iteration count
+m_krylov = max_it + 1
 
 n = m * m # number of unknowns
 
@@ -40,19 +41,19 @@ sinv.convert(PETSc.Mat.Type.AIJ)
 sinv.setUp()
 sinv.assemble()
 
-ksp = PETSc.KSP().create()
-ksp.setOperators(amat)
+Aksp = PETSc.KSP().create()
+Aksp.setOperators(amat)
+
+block_params = {
+    "ksp_type": "cg" if symmetric else "gmres",
+    "ksp_max_it": 100,
+    "ksp_rtol": 1e-10,
+    "pc_type": "hypre",
+}
 
 petsctools.set_from_options(
-    ksp, options_prefix="",
-    parameters={
-        "ksp_type": "cg" if symmetric else "gmres",
-        "ksp_max_it": 100,
-        "ksp_rtol": 1e-10,
-        "pc_type": "hypre",
-        "ksp_reuse_preconditioner": None,
-        # "ksp_converged_reason": None,
-    }
+    Aksp, options_prefix="A",
+    parameters=block_params,
 )
 
 # Create single rhs data
@@ -69,7 +70,7 @@ kronmat = PETSc.Mat().createPython(
 kronmat.setUp()
 kronmat.assemble()
 
-X = eksm(kronmat, ksp, b, m_krylov, rtol)
+X = eksm(kronmat, Aksp, b, m_krylov=m_krylov, rtol=atol)
 
 # Check true residual norms
 norms = np.zeros((p,1))
@@ -87,9 +88,12 @@ petsctools.set_from_options(
     kronksp, options_prefix="kron",
     parameters={
         "ksp_converged_reason": None,
-        "ksp_rtol": rtol,
-        "ksp_type": "gmres",
-        "pc_type": "none",
+        "ksp_monitor": None,
+        "ksp_atol": atol,
+        "ksp_max_it": max_it,
+        "ksp_type": "python",
+        "ksp_python_type": "eksm.SylvesterEKSP",
+        "sylvester": block_params,
     }
 )
 bfull = kronmat.getPythonContext().vec_nest.duplicate()

@@ -140,9 +140,18 @@ class KroneckerProductMat:
         yn.copy(result=y)
 
 
-def eksm(kronmat, Aksp, b, m_krylov, rtol):
-    kronctx = kronmat.getPythonContext()
-    amat, smat = kronctx.A, kronctx.S
+def eksm(kronmat, Aksp, b, *, ksp=None, m_krylov=None, rtol=None, adaptive_rtol=False):
+    kron = kronmat.getPythonContext()
+    amat, smat = kron.A, kron.S
+
+    if ksp:
+        atol = ksp.atol
+        m_krylov = ksp.max_it + 1
+        ksp.its = 0
+    else:
+        assert rtol is not None
+        assert m_krylov is not None
+        atol = rtol
 
     n = amat.size[0]
     p = smat.size[0]
@@ -153,15 +162,15 @@ def eksm(kronmat, Aksp, b, m_krylov, rtol):
     smat.convert(PETSc.Mat.Type.AIJ)
 
     # Set Extended Krylov space quantities
-    X = np.zeros((n,p)) # solution matrix
-    Varray = np.zeros((n, 2 * m_krylov + 2)) # matrix holding basis vectors
-    H = np.zeros((2 * m_krylov + 1, 2 * m_krylov)) # to hold projected problem
-    c = np.zeros((2 * m_krylov + 1, 1)) # projected rhs
-    y = np.zeros((2 * m_krylov, p)) # projected solution
+    X = np.zeros((n, p))  # solution matrix
+    Varray = np.zeros((n, 2 * m_krylov + 2))  # matrix holding basis vectors
+    H = np.zeros((2 * m_krylov + 1, 2 * m_krylov))  # to hold projected problem
+    c = np.zeros((2 * m_krylov + 1, 1))  # projected rhs
+    y = np.zeros((2 * m_krylov, p))  # projected solution
 
     # First basis vector (orthogonalised rhs)
     beta = b.norm()
-    c[0,0] = beta
+    c[0, 0] = beta
     w = b.copy()
     w /= beta
 
@@ -173,6 +182,8 @@ def eksm(kronmat, Aksp, b, m_krylov, rtol):
     _, normwp, hp = V.append(w)
     hp = np.append(hp, normwp)
 
+    if adaptive_rtol:
+        ksp_rtol0 = Aksp.rtol
     for i in range(m_krylov):
         # New basis vector (obtained by mult by A)
         amat.mult(V[-1], w)
@@ -208,59 +219,91 @@ def eksm(kronmat, Aksp, b, m_krylov, rtol):
         # Solve projected problem
         temp = 2*i+2
         y = solve_sylvester(
-            H[:temp,:temp], S,
+            H[:temp, :temp], S,
             np.outer(c[:temp], np.ones(p)))
 
         # Check residual norm
-        r = H[temp:temp+p,:temp] @ y
-        rnorms = np.zeros((p,1))
+        r = H[temp:temp+p, :temp] @ y
+        rnorms = np.zeros((p, 1))
         for k in range(p):
-            rnorms[k] = norm(r[:,k])/beta
+            rnorms[k] = norm(r[:, k])/beta
+        rnorm = norm(rnorms)
 
-        print(f"max r_{i}: {max(rnorms)[0]:.6e}")
-        if(np.max(rnorms) < rtol):
+        if ksp:
+            ksp.monitor(i, rnorm)
+            ksp.logConvergenceHistory(rnorm)
+            ksp.its += 1
+            ksp.norm = rnorm
+        else:
+            print(f"|r_{i}|: {rnorm:.6e} \\ max |r_{i}|: {max(rnorms)[0]:.6e}")
+
+        # ksp.callConvergenceTest(i, rnorm)
+        if rnorm < atol:
+            if ksp:
+                ksp.setConvergedReason(
+                    PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
+            else:
+                print(f"Residual norm absolute tolerance reached.")
+            if adaptive_rtol:
+                Aksp.setTolerances(rtol=ksp_rtol0)
             break
-        if PETSc.Options().getBool("adaptive_rtol", False):
+        elif i >= m_krylov - 1:
+            if ksp:
+                ksp.setConvergedReason(
+                    PETSc.KSP.ConvergedReason.CONVERGED_ITS)
+            else:
+                print(f"Maximum iterations reached.")
+            if adaptive_rtol:
+                Aksp.setTolerances(rtol=ksp_rtol0)
+            break
+
+        if adaptive_rtol:
             maxNormR = np.max(rnorms)
             Aksp.setTolerances(rtol=min(Aksp.rtol/maxNormR, 0.1))
+    if adaptive_rtol:
+        Aksp.setTolerances(rtol=ksp_rtol0)
 
     # Solution recovery
     for i, v in enumerate(V.vectors):
         Varray[:, i] = v.array_r
-    X = Varray[:,:temp]@y
+    X = Varray[:, :temp]@y
     return X
 
 
-class ShiftedExtendedKSP:
-    """Solve: S*I_{a} + I_{s}*A  (* is kronecker product)
+class SylvesterEKSP:
+    """(Is*A + S*Ia)x = b <=> AX + XS = B
     """
 
-    prefix = "shift_"
+    prefix = "sylvester_"
 
-    def setUp(self, ksp, b, x):
-        Akron, Pkron = ksp.getOperators()
+    def setUp(self, ksp):
+        self.mat, _ = ksp.getOperators()
+        kron = self.mat.getPythonContext()
 
-        A = Akron.getMat(0, 1)
-        S = Akron.getMat(1, 0)
-
-        self.n, _ = A.getSizes()
-        self.p, _ = S.getSizes()
-
-        self.s = S.getDiagonal().array_r
-
-        Ap = Pkron.getMat(0, 1)
-
-        prefix = ksp.getOptionsPrefix() or ""
+        prefix = f"{ksp.getOptionsPrefix() or ''}{self.prefix}"
         self.Aksp = PETSc.KSP().create()
-        self.Aksp.setOperators(A, Ap)
-        self.Aksp.setPrefix(prefix+self.prefix)
-        self.Aksp.setFromOptions()
-        self.Aksp.setUp()
+        self.Aksp.setOperators(kron.A)
+
+        petsctools.set_from_options(
+            self.Aksp, options_prefix=prefix)
 
         self.adaptive_rtol = PETSc.Options().getBool(
-            f"{prefix}ksp_{self.prefix}adaptive_rtol")
+            f"{prefix}ksp_{self.prefix}adaptive_rtol", False)
 
     def solve(self, ksp, b, x):
+        kron = self.mat.getPythonContext()
 
-        X = eksm(self.P, self.Aksp, b,
-                 ksp.max_it, ksp.rtol)
+        bnest = kron.vec_nest.duplicate()
+        b.copy(result=bnest)
+        b0 = kron.A.createVecRight()
+        bnest.getNestSubVecs()[0].copy(result=b0)
+
+        X = eksm(self.mat, self.Aksp, b0, ksp=ksp,
+                 adaptive_rtol=self.adaptive_rtol)
+
+        xnest = kron.vec_nest.duplicate()
+        xsubs = xnest.getNestSubVecs()
+        for k, xsub in enumerate(xsubs):
+            xsub.array[:] = X[:, k]
+        xnest.setNestSubVecs(xsubs)
+        xnest.copy(result=x)
