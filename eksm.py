@@ -274,6 +274,110 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
     X = Varray[:, :temp]@y
     return X
 
+def block_eksm(kronmat, Aksp, b, m_krylov, rtol):
+    kronctx = kronmat.getPythonContext()
+    amat, smat = kronctx.A, kronctx.S
+
+    n = amat.size[0]
+    p = smat.size[0]
+    bs = len(b)
+    if p != bs:
+        raise ValueError("Number of columns in b must match size of S. This is to be fixed when we consider adding" \
+        "an array d so that we are solving AX+XS = b d^T")
+
+    # extract dense numpy array for S
+    smat.convert(PETSc.Mat.Type.DENSE)
+    S = smat.getDenseArray(readonly=True).copy()
+    smat.convert(PETSc.Mat.Type.AIJ)
+
+    # Set Extended Krylov space quantities
+    X = np.zeros((n,p)) # solution matrix
+    Varray = np.zeros((n, (2 * m_krylov + 2)*bs)) # matrix holding basis vectors
+    H = np.zeros((bs * (2 * m_krylov + 1), bs * (2 * m_krylov))) # to hold projected problem
+    L = np.zeros((bs * (2 * m_krylov + 1), bs * (2 * m_krylov))) # to hold projected problem
+    c = np.zeros((bs * (2 * m_krylov + 1), bs * (1           ))) # projected rhs
+    y = np.zeros((bs * (2 * m_krylov    ), bs * (p           ))) # projected solution
+
+    # First basis vector (orthogonalised rhs)
+    beta = b[0].norm()
+    c[0,0] = beta
+    w = b[0].copy()
+    w /= beta
+
+    V = OrthonormalBasis(w)
+    for j in range(1, bs):
+        _, normwp, h = V.append(b[j])
+        c[0:j,j] = h
+        c[j,j] = normwp
+
+    # New vector (multiply previous one by A then orthogonalise)
+    for j in range(bs):
+        with petsctools.inserted_options(Aksp):
+            Aksp.solve(V[j], w)
+        _, normw, h = V.append(w)
+        L[:len(h), j] = h
+        L[len(h), j] = normw
+        H[j, j] = 1
+
+    Aksprtol = Aksp.rtol
+    for i in range(m_krylov):
+        # New basis vector (obtained by mult by A)
+        for j in range(bs):
+            amat.mult(V[-bs+j], w)
+            _, normw, h = V.append(w)
+            H[:len(h), (2*i+1)*bs+j] = h
+            H[len(h), (2*i+1)*bs+j] = normw
+            L[(2*i+1)*bs+j, (2*i+1)*bs+j] = 1
+
+        # print(f"L:\n{L[:(2*i+2)*bs+bs, :(2*i+2)*bs]}")
+        # print(f"H:\n{H[:(2*i+2)*bs+bs, :(2*i+2)*bs]}")
+        # Move on to add next set of basis vectors (obtained by mult by A^-1)
+        for j in range(bs):
+            with petsctools.inserted_options(Aksp):
+                Aksp.solve(V[-bs+j], w)
+            _, normw, h = V.append(w)
+            L[:len(h), (2*i+2)*bs+j] = h
+            L[len(h), (2*i+2)*bs+j] = normw
+            H[(2*i+2)*bs+j, (2*i+2)*bs+j] = 1
+
+        # Note: The following projection data (hp and normwp) are
+        # not ready to be included in H at this stage. It's only
+        # possible to add them into H once we multiply the
+        # corresponding set of vectors by A and use the new
+        # projection data to make the Krylov projection relation
+        # hold.
+        # Hence, at this stage of the process, the relation that
+        # hold is valid up to the so far constructed basis, that
+        # is:
+        #  A V[:,:2*i*p] = V[:,2*i*p+p] H[:2*i*p+p,2*i*p]
+
+        
+        # Solve projected problem
+        temp = (2*i+2)*bs
+        # K = H[:(2*i+2)*bs, :(2*i+2)*bs]/L[:(2*i+2)*bs, :(2*i+2)*bs]
+        K = np.linalg.solve(L[:temp, :temp].T, H[:temp+bs, :temp].T).T
+        y = solve_sylvester(
+            K[:temp,:temp], S,
+            c[:temp,:bs])
+
+        # Check residual norm
+        r = K[temp:temp+bs,:temp] @ y
+        rnorms = np.zeros((p,1))
+        for k in range(p):
+            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,:bs]*d[:bs,k]))
+
+        print(f"max r_{i}: {max(rnorms)[0]:.6e}")
+        if(np.max(rnorms) < rtol):
+            break
+        if PETSc.Options().getBool("adaptive_rtol", False):
+            maxNormR = np.max(rnorms)
+            Aksp.setTolerances(rtol=min(Aksprtol/maxNormR, 0.1))
+
+    # Solution recovery
+    for i, v in enumerate(V.vectors):
+        Varray[:, i] = v.array_r
+    X = Varray[:,:temp]@y
+    return X
 
 class SylvesterEKSP:
     """(Is*A + S*Ia)x = b <=> AX + XS = B
