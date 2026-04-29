@@ -63,27 +63,26 @@ bdata = np.random.randn(n, 1)
 b = amat.createVecRight()
 b.array[:] = bdata.flatten()
 
+# low rank rhs
+d = sinv.createVecRight()
+d.array[:] = np.random.random_sample(p)
+
 kronmat = PETSc.Mat().createPython(
     size=((n*p, n*p), (n*p, n*p)),
-    context=KroneckerProductMat(amat, sinv),
+    context=KroneckerProductMat(amat, sinv, d),
 )
 kronmat.setUp()
 kronmat.assemble()
 
-ddata = np.random.randn(p, 1)
-ddata = np.ones(p)
-d = sinv.createVecRight()
-d.array[:] = ddata.flatten()
-
-X = eksm(kronmat, Aksp, b, d, m_krylov=m_krylov, atol=atol)
+X = eksm(kronmat, Aksp, b, m_krylov=m_krylov, atol=atol)
 
 # Check true residual norms
-norms = np.zeros((p,1))
+norms = np.zeros(p)
 R = A@X+X@Sinv
 beta = norm(b)
 for k in range(p):
     norms[k] = np.linalg.norm(d.array_r[k]*bdata.T-R[:,k])/((np.abs(d.array_r[k]) + 2 * np.finfo(d.array_r[k]).eps) * beta)
-print(f"eksm: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+print(f"eksm: Maximum of true residual norms: {max(np.abs(norms)):.6e}")
 print(f"eksm: True residual norms:\n{np.abs(norms)}")
 
 # KSP for the full kronecker matrix
@@ -125,7 +124,7 @@ beta = norm(b)
 for k in range(p):
     norms[k] = np.linalg.norm(d.array_r[k]*bdata.T-R[:,k])/((np.abs(d.array_r[k]) + 2 * np.finfo(d.array_r[k]).eps) * beta)
 
-print(f"ksp: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+print(f"ksp: Maximum of true residual norms: {max(np.abs(norms)):.6e}")
 print(f"ksp: True residual norms:\n{np.abs(norms)}")
 
 for k in range(p):

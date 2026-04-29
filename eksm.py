@@ -102,9 +102,14 @@ class OrthonormalBasis:
 class KroneckerProductMat:
     """Apply: S*I_{a} + I_{s}*A  (* is kronecker product)
     """
-    def __init__(self, A, S):
+    def __init__(self, A, S, d=None):
         self.A = A
         self.S = S
+
+        if d is None:
+            sinv.createVecRight()
+            d.array[:] = 1
+        self.d = d
 
         self.S.convert(PETSc.Mat.Type.DENSE)
         self.Sa = S.getDenseArray(readonly=True).copy()
@@ -140,7 +145,7 @@ class KroneckerProductMat:
         yn.copy(result=y)
 
 
-def eksm(kronmat, Aksp, b, d=None, *, kronksp=None, m_krylov=None, atol=None, adaptive_rtol=False):
+def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_rtol=False):
     kron = kronmat.getPythonContext()
     amat, smat = kron.A, kron.S
 
@@ -160,7 +165,7 @@ def eksm(kronmat, Aksp, b, d=None, *, kronksp=None, m_krylov=None, atol=None, ad
     S = smat.getDenseArray(readonly=True).copy()
     smat.convert(PETSc.Mat.Type.AIJ)
 
-    darr = d.array_r if d else np.ones(p)
+    darr = kron.d.array_r
 
     # Set Extended Krylov space quantities
     X = np.zeros((n, p))  # solution matrix
@@ -297,6 +302,8 @@ class SylvesterEKSP:
         b.copy(result=bnest)
         b0 = kron.A.createVecRight()
         bnest.getNestSubVecs()[0].copy(result=b0)
+
+        b0.scale(1/kron.d.array_r[0])
 
         X = eksm(self.mat, self.Aksp, b0, kronksp=ksp,
                  adaptive_rtol=self.adaptive_rtol)
