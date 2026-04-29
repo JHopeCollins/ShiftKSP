@@ -145,7 +145,7 @@ class KroneckerProductMat:
         yn.copy(result=y)
 
 
-def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_rtol=False):
+def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_tol=False):
     kron = kronmat.getPythonContext()
     amat, smat = kron.A, kron.S
 
@@ -188,7 +188,7 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_r
     _, normwp, hp = V.append(w)
     hp = np.append(hp, normwp)
 
-    if adaptive_rtol:
+    if adaptive_tol:
         Aksp_rtol0 = Aksp.rtol
 
     for i in range(m_krylov):
@@ -261,11 +261,11 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_r
                 print(f"Maximum iterations reached.")
             break
 
-        if adaptive_rtol:
+        if adaptive_tol:
             maxNormR = np.max(rnorms)
             Aksp.setTolerances(rtol=min(Aksp_rtol0/maxNormR, 0.1))
 
-    if adaptive_rtol:
+    if adaptive_tol:
         Aksp.setTolerances(rtol=Aksp_rtol0)
 
     # Solution recovery
@@ -285,15 +285,15 @@ class SylvesterEKSP:
         self.mat, _ = ksp.getOperators()
         kron = self.mat.getPythonContext()
 
-        prefix = f"{ksp.getOptionsPrefix() or ''}{self.prefix}"
+        prefix = ksp.getOptionsPrefix() or ''
         self.Aksp = PETSc.KSP().create()
         self.Aksp.setOperators(kron.A)
 
         petsctools.set_from_options(
-            self.Aksp, options_prefix=prefix)
+            self.Aksp, options_prefix=prefix + self.prefix)
 
-        self.adaptive_rtol = PETSc.Options().getBool(
-            f"{prefix}ksp_{self.prefix}adaptive_rtol", False)
+        self.adaptive_tol = PETSc.Options().getBool(
+            f"{prefix}ksp_{self.prefix}adaptive_tol", False)
 
     def solve(self, ksp, b, x):
         kron = self.mat.getPythonContext()
@@ -306,7 +306,7 @@ class SylvesterEKSP:
         b0.scale(1/kron.d.array_r[0])
 
         X = eksm(self.mat, self.Aksp, b0, kronksp=ksp,
-                 adaptive_rtol=self.adaptive_rtol)
+                 adaptive_tol=self.adaptive_tol)
 
         xnest = kron.vec_nest.duplicate()
         xsubs = xnest.getNestSubVecs()
@@ -314,3 +314,19 @@ class SylvesterEKSP:
             xsub.array[:] = X[:, k]
         xnest.setNestSubVecs(xsubs)
         xnest.copy(result=x)
+
+    def view(self, ksp, viewer=None):
+        if viewer is None:
+            return
+        if viewer.type != PETSc.Viewer.Type.ASCII:
+            return
+        viewer.printfASCII(
+            "Extended Krylov method for solving a Sylvester equation AX+SX=B.\n")
+        if self.adaptive_tol:
+            viewer.printfASCII(
+                "  Using an adaptive tolerance for the KSP for A.\n")
+        viewer.printfASCII(
+            "  The KSP for solving A is:\n")
+        viewer.pushASCIITab()
+        self.Aksp.view(viewer)
+        viewer.popASCIITab()

@@ -22,6 +22,7 @@ re = options.getReal("re", 10)
 angle = options.getReal("angle", pi/3)
 order = options.getInt("order", 8)
 max_it = options.getInt("max_it", 100) # maximum iteration count
+adaptive_tol = options.getBool("adaptive_tol", False)
 m_krylov = max_it + 1
 
 n = m * m # number of unknowns
@@ -74,7 +75,8 @@ kronmat = PETSc.Mat().createPython(
 kronmat.setUp()
 kronmat.assemble()
 
-X = eksm(kronmat, Aksp, b, m_krylov=m_krylov, atol=atol)
+X = eksm(kronmat, Aksp, b, m_krylov=m_krylov,
+         atol=atol, adaptive_tol=adaptive_tol)
 
 # Check true residual norms
 norms = np.zeros(p)
@@ -91,12 +93,13 @@ kronksp.setOperators(kronmat)
 petsctools.set_from_options(
     kronksp, options_prefix="kron",
     parameters={
-        "ksp_converged_reason": None,
+        "ksp_converged_rate": None,
         "ksp_monitor": None,
         "ksp_atol": atol,
         "ksp_max_it": max_it,
         "ksp_type": "python",
         "ksp_python_type": "eksm.SylvesterEKSP",
+        "ksp_sylvester_adaptive_tol": adaptive_tol,
         "sylvester": block_params,
     }
 )
