@@ -140,18 +140,17 @@ class KroneckerProductMat:
         yn.copy(result=y)
 
 
-def eksm(kronmat, Aksp, b, *, ksp=None, m_krylov=None, rtol=None, adaptive_rtol=False):
+def eksm(kronmat, Aksp, b, d=None, *, kronksp=None, m_krylov=None, atol=None, adaptive_rtol=False):
     kron = kronmat.getPythonContext()
     amat, smat = kron.A, kron.S
 
-    if ksp:
-        atol = ksp.atol
-        m_krylov = ksp.max_it + 1
-        ksp.its = 0
+    if kronksp:
+        atol = kronksp.atol
+        m_krylov = kronksp.max_it + 1
+        kronksp.its = 0
     else:
-        assert rtol is not None
+        assert atol is not None
         assert m_krylov is not None
-        atol = rtol
 
     n = amat.size[0]
     p = smat.size[0]
@@ -160,6 +159,8 @@ def eksm(kronmat, Aksp, b, *, ksp=None, m_krylov=None, rtol=None, adaptive_rtol=
     smat.convert(PETSc.Mat.Type.DENSE)
     S = smat.getDenseArray(readonly=True).copy()
     smat.convert(PETSc.Mat.Type.AIJ)
+
+    darr = d.array_r if d else np.ones(p)
 
     # Set Extended Krylov space quantities
     X = np.zeros((n, p))  # solution matrix
@@ -183,7 +184,8 @@ def eksm(kronmat, Aksp, b, *, ksp=None, m_krylov=None, rtol=None, adaptive_rtol=
     hp = np.append(hp, normwp)
 
     if adaptive_rtol:
-        ksp_rtol0 = Aksp.rtol
+        Aksp_rtol0 = Aksp.rtol
+
     for i in range(m_krylov):
         # New basis vector (obtained by mult by A)
         amat.mult(V[-1], w)
@@ -220,48 +222,46 @@ def eksm(kronmat, Aksp, b, *, ksp=None, m_krylov=None, rtol=None, adaptive_rtol=
         temp = 2*i+2
         y = solve_sylvester(
             H[:temp, :temp], S,
-            np.outer(c[:temp], np.ones(p)))
+            np.outer(c[:temp], darr[:p]))
 
         # Check residual norm
-        r = H[temp:temp+p, :temp] @ y
-        rnorms = np.zeros((p, 1))
+        r = H[temp:temp+1, :temp] @ y
+        rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:, k])/beta
+            rnorms[k] = norm(r[:,k]) / ((np.abs(darr[k])+2*np.finfo(darr[k]).eps) * beta)
         rnorm = norm(rnorms)
 
-        if ksp:
-            ksp.monitor(i, rnorm)
-            ksp.logConvergenceHistory(rnorm)
-            ksp.its += 1
-            ksp.norm = rnorm
+        if kronksp:
+            kronksp.monitor(i, rnorm)
+            kronksp.logConvergenceHistory(rnorm)
+            kronksp.its += 1
+            kronksp.norm = rnorm
         else:
             print(f"|r_{i}|: {rnorm:.6e} \\ max |r_{i}|: {max(rnorms)[0]:.6e}")
 
-        # ksp.callConvergenceTest(i, rnorm)
+        # kronksp.callConvergenceTest(i, rnorm)
         if rnorm < atol:
-            if ksp:
-                ksp.setConvergedReason(
+            if kronksp:
+                kronksp.setConvergedReason(
                     PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
             else:
                 print(f"Residual norm absolute tolerance reached.")
-            if adaptive_rtol:
-                Aksp.setTolerances(rtol=ksp_rtol0)
             break
+
         elif i >= m_krylov - 1:
-            if ksp:
-                ksp.setConvergedReason(
+            if kronksp:
+                kronksp.setConvergedReason(
                     PETSc.KSP.ConvergedReason.CONVERGED_ITS)
             else:
                 print(f"Maximum iterations reached.")
-            if adaptive_rtol:
-                Aksp.setTolerances(rtol=ksp_rtol0)
             break
 
         if adaptive_rtol:
             maxNormR = np.max(rnorms)
-            Aksp.setTolerances(rtol=min(Aksp.rtol/maxNormR, 0.1))
+            Aksp.setTolerances(rtol=min(Aksp_rtol0/maxNormR, 0.1))
+
     if adaptive_rtol:
-        Aksp.setTolerances(rtol=ksp_rtol0)
+        Aksp.setTolerances(rtol=Aksp_rtol0)
 
     # Solution recovery
     for i, v in enumerate(V.vectors):
@@ -298,7 +298,7 @@ class SylvesterEKSP:
         b0 = kron.A.createVecRight()
         bnest.getNestSubVecs()[0].copy(result=b0)
 
-        X = eksm(self.mat, self.Aksp, b0, ksp=ksp,
+        X = eksm(self.mat, self.Aksp, b0, kronksp=ksp,
                  adaptive_rtol=self.adaptive_rtol)
 
         xnest = kron.vec_nest.duplicate()
