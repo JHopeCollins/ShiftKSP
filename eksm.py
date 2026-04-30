@@ -274,16 +274,16 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
     X = Varray[:, :temp]@y
     return X
 
-def block_eksm(kronmat, Aksp, b, m_krylov, rtol):
+def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
     kronctx = kronmat.getPythonContext()
     amat, smat = kronctx.A, kronctx.S
 
     n = amat.size[0]
     p = smat.size[0]
     bs = len(b)
-    if p != bs:
-        raise ValueError("Number of columns in b must match size of S. This is to be fixed when we consider adding" \
-        "an array d so that we are solving AX+XS = b d^T")
+    # if p != bs:
+    #     raise ValueError("Number of columns in b must match size of S. This is to be fixed when we consider adding" \
+    #     "an array d so that we are solving AX+XS = b d^T")
 
     # extract dense numpy array for S
     smat.convert(PETSc.Mat.Type.DENSE)
@@ -309,7 +309,6 @@ def block_eksm(kronmat, Aksp, b, m_krylov, rtol):
         _, normwp, h = V.append(b[j])
         c[0:j,j] = h
         c[j,j] = normwp
-
     # New vector (multiply previous one by A then orthogonalise)
     for j in range(bs):
         with petsctools.inserted_options(Aksp):
@@ -323,18 +322,18 @@ def block_eksm(kronmat, Aksp, b, m_krylov, rtol):
     for i in range(m_krylov):
         # New basis vector (obtained by mult by A)
         for j in range(bs):
-            amat.mult(V[-bs+j], w)
+            # amat.mult(V[-bs+j], w)
+            amat.mult(V[(2*i+1)*bs+j], w)
             _, normw, h = V.append(w)
             H[:len(h), (2*i+1)*bs+j] = h
             H[len(h), (2*i+1)*bs+j] = normw
             L[(2*i+1)*bs+j, (2*i+1)*bs+j] = 1
 
-        # print(f"L:\n{L[:(2*i+2)*bs+bs, :(2*i+2)*bs]}")
-        # print(f"H:\n{H[:(2*i+2)*bs+bs, :(2*i+2)*bs]}")
         # Move on to add next set of basis vectors (obtained by mult by A^-1)
         for j in range(bs):
             with petsctools.inserted_options(Aksp):
-                Aksp.solve(V[-bs+j], w)
+                # Aksp.solve(V[-bs+j], w)
+                Aksp.solve(V[(2*i+2)*bs+j], w)
             _, normw, h = V.append(w)
             L[:len(h), (2*i+2)*bs+j] = h
             L[len(h), (2*i+2)*bs+j] = normw
@@ -351,19 +350,20 @@ def block_eksm(kronmat, Aksp, b, m_krylov, rtol):
         # is:
         #  A V[:,:2*i*p] = V[:,2*i*p+p] H[:2*i*p+p,2*i*p]
 
-        
         # Solve projected problem
         temp = (2*i+2)*bs
         # K = H[:(2*i+2)*bs, :(2*i+2)*bs]/L[:(2*i+2)*bs, :(2*i+2)*bs]
         K = np.linalg.solve(L[:temp, :temp].T, H[:temp+bs, :temp].T).T
+        
+
         y = solve_sylvester(
             K[:temp,:temp], S,
-            c[:temp,:bs])
+            c[:temp,:bs] @ d[:bs,:])
         # Check residual norm
         r = K[temp:temp+bs,:temp] @ y
         rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,k]))
+            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,:bs] @ d[:bs,k]) * (norm(d[:bs,k])+2*np.finfo(norm(d[:bs,k])).eps))
 
         print(f"max r_{i}: {max(rnorms)[0]:.6e}")
         if(np.max(rnorms) < rtol):

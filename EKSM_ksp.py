@@ -92,19 +92,21 @@ print(f"eksm: True residual norms:\n{np.abs(norms)}")
 b1 = amat.createVecRight()
 b1data = np.random.randn(n, 1)
 b1.array[:] = b1data.flatten()
-ddata1 = np.eye(2)
+ddata1 = np.random.randn(2,p)
 
 bs = [b,b1]
 ds = ddata1
 # bs = [b]
 # ds = ddata
-X1 = block_eksm(kronmat, Aksp, bs, m_krylov, 1e-10)
+X1 = block_eksm(kronmat, Aksp, bs, ds, m_krylov, 1e-10)
 R = A@X1+X1@Sinv
-norms[0] = np.linalg.norm(bdata.T- R[:,0])/(np.linalg.norm(bdata.T))
-norms[1] = np.linalg.norm(b1data.T- R[:,1])/(np.linalg.norm(b1data.T))
 
+for k in range(p):
+    norms[k] = np.linalg.norm(bdata.T * ddata1[0,k] + b1data.T * ddata1[1,k] - R[:,k])\
+        /(np.linalg.norm(bdata.T * ddata1[0,k] + b1data.T * ddata1[1,k]) + 2 * \
+          np.finfo(np.linalg.norm(bdata.T * ddata1[0,k] + b1data.T * ddata1[1,k])).eps)
 # print(f"eksm: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
-print(f"eksm: True residual norms:\n{np.abs(norms)}")
+print(f"block eksm: True residual norms:\n{np.abs(norms)}")
 
 
 # KSP for the full kronecker matrix
