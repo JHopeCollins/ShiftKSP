@@ -8,7 +8,7 @@ from scipy.sparse.linalg import splu, LinearOperator, gmres
 from scipy.linalg import solve_sylvester, norm
 import butchertableau as bt
 
-from eksm import eksm, KroneckerProductMat
+from eksm import eksm, KroneckerProductMat, block_eksm
 from problem import Amat, Smat
 
 np.random.seed(6)
@@ -86,6 +86,26 @@ for k in range(p):
     norms[k] = np.linalg.norm(d.array_r[k]*bdata.T-R[:,k])/((np.abs(d.array_r[k]) + 2 * np.finfo(d.array_r[k]).eps) * beta)
 print(f"eksm: Maximum of true residual norms: {max(np.abs(norms)):.6e}")
 print(f"eksm: True residual norms:\n{np.abs(norms)}")
+
+
+
+b1 = amat.createVecRight()
+b1data = np.random.randn(n, 1)
+b1.array[:] = b1data.flatten()
+ddata1 = np.eye(2)
+
+bs = [b,b1]
+ds = ddata1
+# bs = [b]
+# ds = ddata
+X1 = block_eksm(kronmat, Aksp, bs, m_krylov, 1e-10)
+R = A@X1+X1@Sinv
+norms[0] = np.linalg.norm(bdata.T- R[:,0])/(np.linalg.norm(bdata.T))
+norms[1] = np.linalg.norm(b1data.T- R[:,1])/(np.linalg.norm(b1data.T))
+
+# print(f"eksm: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+print(f"eksm: True residual norms:\n{np.abs(norms)}")
+
 
 # KSP for the full kronecker matrix
 kronksp = PETSc.KSP().create()
