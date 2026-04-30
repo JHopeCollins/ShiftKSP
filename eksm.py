@@ -359,12 +359,11 @@ def block_eksm(kronmat, Aksp, b, m_krylov, rtol):
         y = solve_sylvester(
             K[:temp,:temp], S,
             c[:temp,:bs])
-
         # Check residual norm
         r = K[temp:temp+bs,:temp] @ y
         rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,:bs]*d[:bs,k]))
+            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,k]))
 
         print(f"max r_{i}: {max(rnorms)[0]:.6e}")
         if(np.max(rnorms) < rtol):
