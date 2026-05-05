@@ -322,8 +322,8 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
     for i in range(m_krylov):
         # New basis vector (obtained by mult by A)
         for j in range(bs):
-            # amat.mult(V[-bs+j], w)
-            amat.mult(V[(2*i+1)*bs+j], w)
+            amat.mult(V[-bs], w)
+            # amat.mult(V[(2*i+1)*bs+j], w)
             _, normw, h = V.append(w)
             H[:len(h), (2*i+1)*bs+j] = h
             H[len(h), (2*i+1)*bs+j] = normw
@@ -332,8 +332,8 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
         # Move on to add next set of basis vectors (obtained by mult by A^-1)
         for j in range(bs):
             with petsctools.inserted_options(Aksp):
-                # Aksp.solve(V[-bs+j], w)
-                Aksp.solve(V[(2*i+2)*bs+j], w)
+                Aksp.solve(V[-bs], w)
+                # Aksp.solve(V[(2*i+2)*bs+j], w)
             _, normw, h = V.append(w)
             L[:len(h), (2*i+2)*bs+j] = h
             L[len(h), (2*i+2)*bs+j] = normw

@@ -29,6 +29,9 @@ n = m * m # number of unknowns
 # Block matrix
 A, amat = Amat(m, re, angle=angle, symmetric=symmetric, petsc=True)
 
+dt = options.getReal("dt", 1.0)
+A = dt * A
+amat.scale(dt)
 # Butcher tableau matrix
 S, Sinv = Smat(order)
 p = Sinv.shape[0]
@@ -43,6 +46,13 @@ sinv.convert(PETSc.Mat.Type.AIJ)
 sinv.setUp()
 sinv.assemble()
 
+if options.getBool("shift", False):
+    Lam = np.real(np.linalg.eigvals(Sinv))
+    lam = Lam.min()
+    print(f"Minimum real part of eigenvalues of S^-1: {Lam}")
+    amat.shift(lam)
+    sinv.shift(-lam)
+    
 Aksp = PETSc.KSP().create()
 Aksp.setOperators(amat)
 
@@ -51,6 +61,7 @@ block_params = {
     "ksp_max_it": 100,
     "ksp_rtol": 1e-10,
     "pc_type": "hypre",
+    'ksp_converged_reason': None,
 }
 
 petsctools.set_from_options(
