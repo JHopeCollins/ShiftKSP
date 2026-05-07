@@ -61,7 +61,6 @@ block_params = {
     "ksp_max_it": 100,
     "ksp_rtol": 1e-10,
     "pc_type": "hypre",
-    'ksp_converged_reason': None,
 }
 
 petsctools.set_from_options(
@@ -98,25 +97,27 @@ for k in range(p):
 print(f"eksm: Maximum of true residual norms: {max(np.abs(norms)):.6e}")
 print(f"eksm: True residual norms:\n{np.abs(norms)}")
 
+nb = 4
+bsdata = np.random.randn(n, nb)
+bsdata[:,0] = bdata.flatten()
 
+bs = []
+for i in range(nb):
+    bs.append(amat.createVecRight())
+    bs[-1].array[:] = bsdata[:,i]
 
-b1 = amat.createVecRight()
-b1data = np.random.randn(n, 1)
-b1.array[:] = b1data.flatten()
-ddata1 = np.random.randn(2,p)
+ds = np.random.randn(nb,p)
+ds = np.eye(p)
 
-bs = [b,b1]
-ds = ddata1
-# bs = [b]
-# ds = ddata
-X1 = block_eksm(kronmat, Aksp, bs, ds, m_krylov, 1e-10)
+X1 = block_eksm(kronmat, Aksp, bs, ds, m_krylov, atol)
 R = A@X1+X1@Sinv
 
+eps = np.finfo(bdata.dtype).eps
 for k in range(p):
-    norms[k] = np.linalg.norm(bdata.T * ddata1[0,k] + b1data.T * ddata1[1,k] - R[:,k])\
-        /(np.linalg.norm(bdata.T * ddata1[0,k] + b1data.T * ddata1[1,k]) + 2 * \
-          np.finfo(np.linalg.norm(bdata.T * ddata1[0,k] + b1data.T * ddata1[1,k])).eps)
-# print(f"eksm: Maximum of true residual norms: {max(np.abs(norms))[0]:.6e}")
+    bnorms = sum(bsdata[:,i].T*ds[i, k] for i in range(nb))
+    norms[k] = (
+        np.linalg.norm(bnorms - R[:,k])/np.linalg.norm(bnorms + 2*eps)
+    )
 print(f"block eksm: True residual norms:\n{np.abs(norms)}")
 
 
@@ -142,8 +143,9 @@ xfull = kronmat.getPythonContext().vec_nest.duplicate()
 # duplicate b into all blocks of the full rhs
 bsubs = bfull.getNestSubVecs()
 for i, bi in enumerate(bsubs):
-    b.copy(result=bi)
-    bi.scale(d.array_r[i]) # scale by d[i]
+    # b.copy(result=bi)
+    # bi.scale(d.array_r[i]) # scale by d[i]
+    bi.array[:] = bsdata[:, i]
 bfull.setNestSubVecs(bsubs)
 
 with petsctools.inserted_options(kronksp):
@@ -156,14 +158,16 @@ for i, xi in enumerate(xsubs):
     Xkron[:, i] = xi.array_r
 
 R = A@Xkron+Xkron@Sinv
-beta = norm(b)
 for k in range(p):
-    norms[k] = np.linalg.norm(d.array_r[k]*bdata.T-R[:,k])/((np.abs(d.array_r[k]) + 2 * np.finfo(d.array_r[k]).eps) * beta)
+    bnorms = sum(bsdata[:,i].T*ds[i, k] for i in range(nb))
+    norms[k] = (
+        np.linalg.norm(bnorms - R[:,k])/np.linalg.norm(bnorms + 2*eps)
+    )
 
 print(f"ksp: Maximum of true residual norms: {max(np.abs(norms)):.6e}")
 print(f"ksp: True residual norms:\n{np.abs(norms)}")
 
 for k in range(p):
-    norms[k] = np.linalg.norm(X[:,k]-Xkron[:,k])
+    norms[k] = np.linalg.norm(X1[:,k]-Xkron[:,k])
 
 print(f"Error norms:\n{np.abs(norms)}")

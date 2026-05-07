@@ -6,6 +6,27 @@ from petsc4py import PETSc
 __all__ = ["OrthonormalBasis", "eksm", "KroneckerProductMat"]
 
 
+def vecs2numpy(vecs, arr=None):
+    if arr is None:
+        arr = np.zeros((vecs[0].size, len(vecs)))
+    for i, v in enumerate(vecs):
+        arr[:, i] = v.array_r
+    return arr
+
+
+def numpy2vecs(vecs, arr):
+    for i, v in enumerate(vecs):
+        v.array[:] = arr[:, i]
+    return vecs
+
+
+def numpy2vecnest(vec, arr):
+    subvecs = vec.getNestSubVecs()
+    numpy2vecs(subvecs, arr)
+    vec.setNestSubVecs(subvecs)
+    return vec
+
+
 def mdot(x, y):
     n = len(x)
     r = np.ndarray(n)
@@ -145,7 +166,7 @@ class KroneckerProductMat:
         yn.copy(result=y)
 
 
-def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_tol=False):
+def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_tol=False, xvec=None):
     kron = kronmat.getPythonContext()
     amat, smat = kron.A, kron.S
 
@@ -169,7 +190,6 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
 
     # Set Extended Krylov space quantities
     X = np.zeros((n, p))  # solution matrix
-    Varray = np.zeros((n, 2 * m_krylov + 2))  # matrix holding basis vectors
     H = np.zeros((2 * m_krylov + 1, 2 * m_krylov))  # to hold projected problem
     c = np.zeros((2 * m_krylov + 1, 1))  # projected rhs
     y = np.zeros((2 * m_krylov, p))  # projected solution
@@ -244,7 +264,8 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
         else:
             print(f"|r_{i}|: {rnorm:.6e} \\ max |r_{i}|: {max(rnorms)[0]:.6e}")
 
-        # kronksp.callConvergenceTest(i, rnorm)
+        if kronksp:
+            kronksp.callConvergenceTest(i, rnorm)
         if rnorm < atol:
             if kronksp:
                 kronksp.setConvergedReason(
@@ -269,10 +290,11 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
         Aksp.setTolerances(rtol=Aksp_rtol0)
 
     # Solution recovery
-    for i, v in enumerate(V.vectors):
-        Varray[:, i] = v.array_r
-    X = Varray[:, :temp]@y
+    X = vecs2numpy(V[:-2])@y
+    if xvec:
+        X = numpy2vecnest(xvec, X)
     return X
+
 
 def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
     kronctx = kronmat.getPythonContext()
@@ -354,11 +376,11 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
         temp = (2*i+2)*bs
         # K = H[:(2*i+2)*bs, :(2*i+2)*bs]/L[:(2*i+2)*bs, :(2*i+2)*bs]
         K = np.linalg.solve(L[:temp, :temp].T, H[:temp+bs, :temp].T).T
-        
 
         y = solve_sylvester(
             K[:temp,:temp], S,
             c[:temp,:bs] @ d[:bs,:])
+
         # Check residual norm
         r = K[temp:temp+bs,:temp] @ y
         rnorms = np.zeros((p,1))
@@ -377,6 +399,7 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
         Varray[:, i] = v.array_r
     X = Varray[:,:temp]@y
     return X
+
 
 class SylvesterEKSP:
     """(Is*A + S*Ia)x = b <=> AX + XS = B
@@ -403,19 +426,32 @@ class SylvesterEKSP:
 
         bnest = kron.vec_nest.duplicate()
         b.copy(result=bnest)
-        b0 = kron.A.createVecRight()
-        bnest.getNestSubVecs()[0].copy(result=b0)
 
-        b0.scale(1/kron.d.array_r[0])
+        block = True
 
-        X = eksm(self.mat, self.Aksp, b0, kronksp=ksp,
-                 adaptive_tol=self.adaptive_tol)
+        if block:
+            bs = bnest.getNestSubVecs()
+            ds = np.eye(len(bs))
 
-        xnest = kron.vec_nest.duplicate()
-        xsubs = xnest.getNestSubVecs()
-        for k, xsub in enumerate(xsubs):
-            xsub.array[:] = X[:, k]
-        xnest.setNestSubVecs(xsubs)
+            X = block_eksm(self.mat, self.Aksp, bs, ds, ksp.max_it + 1, ksp.atol)
+
+            xnest = kron.vec_nest.duplicate()
+            numpy2vecnest(xnest, X)
+
+            ksp.setConvergedReason(
+                PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
+
+        else:
+            b0 = kron.A.createVecRight()
+            bnest.getNestSubVecs()[0].copy(result=b0)
+
+            b0.scale(1/kron.d.array_r[0])
+
+            xnest = eksm(
+                self.mat, self.Aksp, b0, kronksp=ksp,
+                adaptive_tol=self.adaptive_tol,
+                xvec=kron.vec_nest.duplicate())
+
         xnest.copy(result=x)
 
     def view(self, ksp, viewer=None):
