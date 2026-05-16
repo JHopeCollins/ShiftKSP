@@ -2,6 +2,7 @@ import numpy as np
 from scipy.linalg import solve_sylvester, norm
 import petsctools
 from petsc4py import PETSc
+Print = PETSc.Sys.Print
 
 __all__ = ["OrthonormalBasis", "eksm", "KroneckerProductMat"]
 
@@ -35,12 +36,13 @@ def mdot(x, y):
     return r
 
 
-def dmult(x, y):
-    wrk = x[0].duplicate()
-    wrk.zeroEntries()
+def dmult(x, y, result=None):
+    if result is None:
+        result = x[0].duplicate()
+    result.zeroEntries()
     for i, alpha in enumerate(y):
-        wrk.axpy(alpha, x[i])
-    return wrk
+        result.axpy(alpha, x[i])
+    return result
 
 
 class OrthonormalBasis:
@@ -118,6 +120,25 @@ class OrthonormalBasis:
         normw = v.normalize()
         v = self._append(v)
         return v, normw, h
+
+
+def extend_basis(op, V, vecs, nprev, H, L=None, wrk=None):
+    if wrk is None:
+        wrk = vecs[0].duplicate()
+    wrk.zeroEntries()
+
+    offset = nprev*len(vecs)
+
+    for j, v in enumerate(vecs):
+        op(v, wrk)
+        _, normw, h = V.append(wrk)
+        if h is not None:
+            H[:len(h), offset+j] = h
+            H[len(h), offset+j] = normw
+        else:
+            H[0, 0] = normw
+        if L is not None:
+            L[offset+j, offset+j] = 1
 
 
 class KroneckerProductMat:
@@ -253,7 +274,8 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
         r = H[temp:temp+1, :temp] @ y
         rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:,k]) / ((np.abs(darr[k])+2*np.finfo(darr[k]).eps) * beta)
+            eps = np.finfo(darr[k]).eps
+            rnorms[k] = norm(r[:,k]) / ((np.abs(darr[k])+2*eps) * beta)
         rnorm = norm(rnorms)
 
         if kronksp:
@@ -261,17 +283,16 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
             kronksp.logConvergenceHistory(rnorm)
             kronksp.its += 1
             kronksp.norm = rnorm
-        else:
-            print(f"|r_{i}|: {rnorm:.6e} \\ max |r_{i}|: {max(rnorms)[0]:.6e}")
-
-        if kronksp:
             kronksp.callConvergenceTest(i, rnorm)
+        else:
+            Print(f"|r_{i}|: {rnorm:.6e} \\ max |r_{i}|: {max(rnorms)[0]:.6e}")
+
         if rnorm < atol:
             if kronksp:
                 kronksp.setConvergedReason(
                     PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
             else:
-                print(f"Residual norm absolute tolerance reached.")
+                Print(f"Residual norm absolute tolerance reached.")
             break
 
         elif i >= m_krylov - 1:
@@ -279,7 +300,7 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
                 kronksp.setConvergedReason(
                     PETSc.KSP.ConvergedReason.CONVERGED_ITS)
             else:
-                print(f"Maximum iterations reached.")
+                Print(f"Maximum iterations reached.")
             break
 
         if adaptive_tol:
@@ -296,9 +317,14 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
     return X
 
 
-def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
+def block_eksm(kronmat, Aksp, b, d, m_krylov=None, rtol=None, xvec=None, kronksp=None, adaptive_tol=False):
     kronctx = kronmat.getPythonContext()
     amat, smat = kronctx.A, kronctx.S
+
+    if kronksp:
+        rtol = kronksp.atol
+        m_krylov = kronksp.max_it + 1
+        kronksp.its = 0
 
     n = amat.size[0]
     p = smat.size[0]
@@ -314,7 +340,6 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
 
     # Set Extended Krylov space quantities
     X = np.zeros((n,p)) # solution matrix
-    Varray = np.zeros((n, (2 * m_krylov + 2)*bs)) # matrix holding basis vectors
     H = np.zeros((bs * (2 * m_krylov + 1), bs * (2 * m_krylov))) # to hold projected problem
     L = np.zeros((bs * (2 * m_krylov + 1), bs * (2 * m_krylov))) # to hold projected problem
     c = np.zeros((bs * (2 * m_krylov + 1), bs * (1           ))) # projected rhs
@@ -340,7 +365,9 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
         L[len(h), j] = normw
         H[j, j] = 1
 
-    Aksprtol = Aksp.rtol
+    if adaptive_tol:
+        Aksp_rtol0 = Aksp.rtol
+
     for i in range(m_krylov):
         # New basis vector (obtained by mult by A)
         for j in range(bs):
@@ -385,19 +412,47 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov, rtol):
         r = K[temp:temp+bs,:temp] @ y
         rnorms = np.zeros((p,1))
         for k in range(p):
-            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,:bs] @ d[:bs,k]) * (norm(d[:bs,k])+2*np.finfo(norm(d[:bs,k])).eps))
+            eps = np.finfo(norm(d[:bs,k])).eps
+            rnorms[k] = norm(r[:,k]) / (norm(c[:bs,:bs] @ d[:bs,k]) * (norm(d[:bs,k])+2*eps))
+        rnorm = norm(rnorms)
 
-        print(f"max r_{i}: {max(rnorms)[0]:.6e}")
-        if(np.max(rnorms) < rtol):
+        if kronksp:
+            kronksp.monitor(i, rnorm)
+            kronksp.logConvergenceHistory(rnorm)
+            kronksp.its += 1
+            kronksp.norm = rnorm
+            kronksp.callConvergenceTest(i, rnorm)
+        else:
+            Print(f"|r_{i}|: {rnorm:.6e} \\ max |r_{i}|: {max(rnorms)[0]:.6e}")
+
+        if rnorm < rtol:
+            if kronksp:
+                kronksp.setConvergedReason(
+                    PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
+            else:
+                Print(f"Residual norm absolute tolerance reached.")
             break
-        if PETSc.Options().getBool("adaptive_rtol", False):
+
+        elif i >= m_krylov - 1:
+            if kronksp:
+                kronksp.setConvergedReason(
+                    PETSc.KSP.ConvergedReason.CONVERGED_ITS)
+            else:
+                Print(f"Maximum iterations reached.")
+            break
+
+        if adaptive_tol:
             maxNormR = np.max(rnorms)
-            Aksp.setTolerances(rtol=min(Aksprtol/maxNormR, 0.1))
+            Aksp.setTolerances(
+                rtol=max(Aksp_rtol0, min(Aksp_rtol0/maxNormR, 0.1)))
+
+    if adaptive_tol:
+        Aksp.setTolerances(rtol=Aksp_rtol0)
 
     # Solution recovery
-    for i, v in enumerate(V.vectors):
-        Varray[:, i] = v.array_r
-    X = Varray[:,:temp]@y
+    X = vecs2numpy(V[:temp])@y
+    if xvec:
+        X = numpy2vecnest(xvec, X)
     return X
 
 
@@ -408,51 +463,112 @@ class SylvesterEKSP:
     prefix = "sylvester_"
 
     def setUp(self, ksp):
-        self.mat, _ = ksp.getOperators()
-        kron = self.mat.getPythonContext()
+        kron = ksp.mat_op.getPythonContext()
 
         prefix = ksp.getOptionsPrefix() or ''
         self.Aksp = PETSc.KSP().create()
         self.Aksp.setOperators(kron.A)
 
-        petsctools.set_from_options(
-            self.Aksp, options_prefix=prefix + self.prefix)
+        self.Aksp.setOptionsPrefix(prefix + self.prefix)
+        self.Aksp.setFromOptions()
+        self.Aksp.incrementTabLevel(1, parent=ksp)
 
         self.adaptive_tol = PETSc.Options().getBool(
             f"{prefix}ksp_{self.prefix}adaptive_tol", False)
 
-    def solve(self, ksp, b, x):
-        kron = self.mat.getPythonContext()
+        self.aksp_max_rtol = PETSc.Options().getReal(
+            f"{prefix}ksp_{self.prefix}aksp_max_rtol", 0.1)
 
-        bnest = kron.vec_nest.duplicate()
+        self.xnest = kron.vec_nest.duplicate()
+        self.bnest = kron.vec_nest.duplicate()
+
+    def solve(self, ksp, b, x):
+        bnest, xnest = self.bnest, self.xnest
         b.copy(result=bnest)
 
-        block = True
+        kronmat = ksp.mat_op.getPythonContext()
+        Amat, Smat = kronmat.A, kronmat.S
+        Aksp = self.Aksp
 
-        if block:
-            bs = bnest.getNestSubVecs()
-            ds = np.eye(len(bs))
+        if self.adaptive_tol:
+            Aksp_rtol0 = Aksp.rtol
 
-            X = block_eksm(self.mat, self.Aksp, bs, ds, ksp.max_it + 1, ksp.atol)
+        # extract dense numpy array for S
+        Smat.convert(PETSc.Mat.Type.DENSE)
+        S = Smat.getDenseArray(readonly=True).copy()
+        Smat.convert(PETSc.Mat.Type.AIJ)
 
-            xnest = kron.vec_nest.duplicate()
-            numpy2vecnest(xnest, X)
+        bs = bnest.getNestSubVecs()
+        nb = len(bs)
 
-            ksp.setConvergedReason(
-                PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
+        n = Amat.size[0]
+        p = Smat.size[0]
+        m_krylov = ksp.max_it + 1
 
-        else:
-            b0 = kron.A.createVecRight()
-            bnest.getNestSubVecs()[0].copy(result=b0)
+        # Set Extended Krylov space quantities
+        H = np.zeros((nb*(2*m_krylov+1), nb*(2*m_krylov))) # to hold projected problem
+        L = np.zeros((nb*(2*m_krylov+1), nb*(2*m_krylov))) # to hold projected problem
+        c = np.zeros((nb*(2*m_krylov+1), nb*(1         ))) # projected rhs
+        y = np.zeros((nb*(2*m_krylov  ), nb*(p         ))) # projected solution
 
-            b0.scale(1/kron.d.array_r[0])
+        # initialise ksp convergence
+        ksp.its = 0
+        ksp.setConvergedReason(PETSc.KSP.ConvergedReason.ITERATING)
 
-            xnest = eksm(
-                self.mat, self.Aksp, b0, kronksp=ksp,
-                adaptive_tol=self.adaptive_tol,
-                xvec=kron.vec_nest.duplicate())
+        V = OrthonormalBasis()
+        self._V = V
+        w = Amat.createVecRight()
 
-        xnest.copy(result=x)
+        # First basis vectors (orthogonalised rhs)
+        extend_basis(lambda v, w: v.copy(w), V, bs, 0, c)
+
+        # New basis vectors (obtained by mult by A^-1)
+        extend_basis(Aksp.solve, V, V[-nb:], 0, L, H)
+
+        for i in range(m_krylov):
+            # New basis vectors (obtained by mult by A then A^-1)
+            extend_basis(Amat.mult, V, V[-nb:], 2*i+1, H, L)
+            extend_basis(Aksp.solve, V, V[-nb:], 2*i+2, L, H)
+
+            # Solve projected problem
+            nvec = (2*i+2)*nb
+            K = np.linalg.solve(L[:nvec, :nvec].T, H[:nvec+nb, :nvec].T).T
+
+            y = solve_sylvester(
+                K[:nvec,:nvec], S,
+                c[:nvec,:nb])
+            self._y = y
+
+            # Check residual norm
+            r = K[nvec:nvec+nb, :nvec] @ y
+            rnorms = np.zeros((p,1))
+            eps = np.finfo(c.dtype).eps
+            for k in range(p):
+                rnorms[k] = norm(r[:,k]) / (norm(c[:nb,:nb][:,k])*(1 + 2*eps))
+            rnorm = norm(rnorms)
+
+            # Monitor convergence
+            ksp.monitor(i, rnorm)
+            self._convergence_test(ksp, i, rnorm)
+            if ksp.getConvergedReason() != 0:
+                break
+
+            if self.adaptive_tol:
+                maxNormR = np.max(rnorms)
+                Aksp.setTolerances(
+                    rtol=max(Aksp_rtol0, min(Aksp_rtol0/maxNormR, self.aksp_max_rtol)))
+
+        if self.adaptive_tol:
+            Aksp.setTolerances(rtol=Aksp_rtol0)
+
+        self.buildSolution(ksp, x)
+
+    def buildSolution(self, ksp, x):
+        xs = self.xnest.getNestSubVecs()
+        for i, xi in enumerate(xs):
+            dmult(self._V, self._y[:,i], result=xi)
+        self.xnest.setNestSubVecs(xs)
+        self.xnest.copy(result=x)
 
     def view(self, ksp, viewer=None):
         if viewer is None:
@@ -461,11 +577,37 @@ class SylvesterEKSP:
             return
         viewer.printfASCII(
             "Extended Krylov method for solving a Sylvester equation AX+SX=B.\n")
+        viewer.printfASCII(
+            f"maximum iterations={ksp.max_it}, initial guess is zero\n")
+        viewer.printfASCII(
+            f"tolerances: relative={ksp.rtol}, absolute={ksp.atol}, divergence={ksp.divtol}.\n")
         if self.adaptive_tol:
             viewer.printfASCII(
-                "  Using an adaptive tolerance for the KSP for A.\n")
+                "Using an adaptive tolerance for the KSP for A.\n")
         viewer.printfASCII(
-            "  The KSP for solving A is:\n")
+            "The KSP for solving A is:\n")
         viewer.pushASCIITab()
         self.Aksp.view(viewer)
         viewer.popASCIITab()
+
+    def _convergence_test(self, ksp, it, rnorm):
+        if it == 0:
+            self._rnorm0 = rnorm
+
+        ksp.norm = rnorm
+        ksp.its += 1
+
+        ksp.logConvergenceHistory(rnorm)
+
+        if it >= ksp.max_it:
+            ksp.setConvergedReason(
+                PETSc.KSP.ConvergedReason.CONVERGED_ITS)
+        elif rnorm < ksp.atol:
+            ksp.setConvergedReason(
+                PETSc.KSP.ConvergedReason.CONVERGED_ATOL)
+        elif rnorm/self._rnorm0 < ksp.rtol:
+            ksp.setConvergedReason(
+                PETSc.KSP.ConvergedReason.CONVERGED_RTOL)
+        elif rnorm/self._rnorm0 > ksp.divtol:
+            ksp.setConvergedReason(
+                PETSc.KSP.ConvergedReason.DIVERGED_DTOL)

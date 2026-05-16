@@ -16,7 +16,7 @@ np.random.seed(6)
 options = PETSc.Options()
 
 atol = options.getReal("atol", 1e-8)
-m = options.getInt("nx", 10)
+m = options.getInt("nx", 100)
 symmetric = options.getBool("symmetric", True)
 re = options.getReal("re", 10)
 angle = options.getReal("angle", pi/3)
@@ -109,7 +109,7 @@ for i in range(nb):
 ds = np.random.randn(nb,p)
 ds = np.eye(p)
 
-X1 = block_eksm(kronmat, Aksp, bs, ds, m_krylov, atol)
+X1 = block_eksm(kronmat, Aksp, bs, ds, m_krylov, atol, adaptive_tol=adaptive_tol)
 R = A@X1+X1@Sinv
 
 eps = np.finfo(bdata.dtype).eps
@@ -127,9 +127,11 @@ kronksp.setOperators(kronmat)
 petsctools.set_from_options(
     kronksp, options_prefix="kron",
     parameters={
+        "ksp_view": ":kronksp_view.log",
         "ksp_converged_rate": None,
         "ksp_monitor": None,
         "ksp_atol": atol,
+        "ksp_rtol": 1e-10,
         "ksp_max_it": max_it,
         "ksp_type": "python",
         "ksp_python_type": "eksm.SylvesterEKSP",
