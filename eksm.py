@@ -682,7 +682,7 @@ class IRKKroneckerPC(petsctools.PCBase):
 
         shift_options = PETSc.Options(pc_prefix + "shift_")
 
-        shift_type = shift_options.getString("type", "none")
+        shift_type = shift_options.getString("type", "eigmin")
         valid_shift_types = ("none", "diag", "eigmin")
         if shift_type not in valid_shift_types:
             raise ValueError(
@@ -698,8 +698,8 @@ class IRKKroneckerPC(petsctools.PCBase):
             shift = 0
 
         if shift != 0:
-            Ainv_array += shift*np.eye(butcher.num_stages)
-            Kform -= shift*Mform
+            Ainv_array -= shift*np.eye(butcher.num_stages)
+            Kform += shift*Mform
 
         # K_assembler = get_assembler(
         #     Kform, bcs=stage_bcs, form_compiler_parameters=ctx.fcp,
