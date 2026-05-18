@@ -155,9 +155,11 @@ def extend_basis(op, V, vecs, nprev, H, L=None, wrk=None):
 
 
 class KroneckerProductMat:
-    """Apply: S*I_{a} + I_{s}*A  (* is kronecker product)
+    """Apply: S*M + I_{s}*A  (* is kronecker product)
+
+    M defaults to I_{a}
     """
-    def __init__(self, A, S, d=None):
+    def __init__(self, A, S, M=None, d=None):
         self.A = A
         self.S = S
 
@@ -170,17 +172,12 @@ class KroneckerProductMat:
         self.Sa = S.getDenseArray(readonly=True).copy()
         self.S.convert(PETSc.Mat.Type.AIJ)
 
-        sub_vecs = []
-        for _ in range(S.sizes[0][0]):
-            v = A.createVecRight()
-            v.setUp()
-            v.assemble()
-            sub_vecs.append(v)
+        self.M = M or PETSc.Mat().createConstantDiagonal(
+            size=A.sizes, diag=1.0, comm=A.comm)
 
         self.vec_nest = PETSc.Vec().createNest(
-            # vecs=[A.createVecRight()
-            #       for _ in range(S.sizes[0][0])],
-            vecs=sub_vecs,
+            vecs=[A.createVecRight()
+                  for _ in range(S.sizes[0][0])],
             comm=A.comm
         )
         self.vec_nest.setUp()
@@ -189,22 +186,26 @@ class KroneckerProductMat:
     def mult(self, mat, x, y):
         xn = self.vec_nest.duplicate()
         yn = self.vec_nest.duplicate()
-        w = self.A.createVecRight()
+        Mx = self.vec_nest.duplicate()
+        Ax = self.vec_nest.duplicate()
 
         x.copy(result=xn)
         y.zeroEntries()
 
         xsubs = xn.getNestSubVecs()
         ysubs = yn.getNestSubVecs()
-        Sa = self.Sa
+        Mxs = Mx.getNestSubVecs()
+        Axs = Ax.getNestSubVecs()
 
+        for xi, Mxi, Axi in zip(xsubs, Mxs, Axs):
+            self.A.mult(xi, Axi)
+            self.M.mult(xi, Mxi)
+
+        Sa = self.Sa
         for i in range(Sa.shape[0]):
-            xi = xsubs[i]
-            yi = ysubs[i]
-            self.A.mult(xi, w)
-            yi += w
+            ysubs[i] += Axs[i]
             for j in range(Sa.shape[1]):
-                yi.axpy(float(Sa[i, j]), xsubs[j])
+                ysubs[i].axpy(float(Sa[i, j]), Mxs[j])
 
         yn.setNestSubVecs(ysubs)
         PETSc.Vec.concatenate(ysubs)[0].copy(result=y)
@@ -483,7 +484,14 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov=None, rtol=None, xvec=None, kronksp
 
 
 class SylvesterEKSP:
-    """(Is*A + S*Ia)x = b <=> AX + XS = B
+    """(S*M + Is*A)x = b <=> (XS^T + Ahat*X) = M^{-1}B; Ahat=M^{-1}A
+    PETSc Options
+    -------------
+
+    -ksp_sylvester_adaptive_tol : adaptive ksp_rtol for A?
+    -ksp_sylvester_aksp_max_rtol : maximum adaptive ksp_rtol for A
+    -sylvester_A_ ... : options for A^{-1}
+    -sylvester_M_ ... : options for M^{-1}
     """
 
     prefix = "sylvester_"
@@ -492,12 +500,18 @@ class SylvesterEKSP:
         kron = ksp.mat_op.getPythonContext()
 
         prefix = ksp.getOptionsPrefix() or ''
+
         self.Aksp = PETSc.KSP().create()
         self.Aksp.setOperators(kron.A)
-
-        self.Aksp.setOptionsPrefix(prefix + self.prefix)
+        self.Aksp.setOptionsPrefix(prefix + self.prefix + "A_")
         self.Aksp.setFromOptions()
         self.Aksp.incrementTabLevel(1, parent=ksp)
+
+        self.Mksp = PETSc.KSP().create()
+        self.Mksp.setOperators(kron.M)
+        self.Mksp.setOptionsPrefix(prefix + self.prefix + "M_")
+        self.Mksp.setFromOptions()
+        self.Mksp.incrementTabLevel(1, parent=ksp)
 
         self.adaptive_tol = PETSc.Options().getBool(
             f"{prefix}ksp_{self.prefix}adaptive_tol", False)
@@ -510,11 +524,10 @@ class SylvesterEKSP:
 
     def solve(self, ksp, b, x):
         bnest, xnest = self.bnest, self.xnest
-        b.copy(result=bnest)
 
         kronmat = ksp.mat_op.getPythonContext()
-        Amat, Smat = kronmat.A, kronmat.S
-        Aksp = self.Aksp
+        Amat, Mmat, Smat = kronmat.A, kronmat.M, kronmat.S
+        Aksp, Mksp = self.Aksp, self.Mksp
 
         if self.adaptive_tol:
             Aksp_rtol0 = Aksp.rtol
@@ -524,7 +537,15 @@ class SylvesterEKSP:
         S = Smat.getDenseArray(readonly=True).copy().T
         Smat.convert(PETSc.Mat.Type.AIJ)
 
+        wnest = bnest.duplicate()
+        b.copy(result=wnest)
+
+        # place M^{-1}B into bnest
+        ws = wnest.getNestSubVecs()
         bs = bnest.getNestSubVecs()
+        for wi, bi in zip(ws, bs):
+            Mksp.solve(wi, bi)
+        
         nb = len(bs)
 
         n = Amat.size[0]
@@ -545,16 +566,24 @@ class SylvesterEKSP:
         self._V = V
         w = Amat.createVecRight()
 
+        def Amult(v, y):
+            Amat.mult(v, w)
+            Mksp.solve(w, y)
+
+        def Asolve(v, y):
+            Mmat.mult(v, w)
+            Aksp.solve(w, y)
+
         # First basis vectors (orthogonalised rhs)
         extend_basis(lambda v, w: v.copy(w), V, bs, 0, c)
 
         # New basis vectors (obtained by mult by A^-1)
-        extend_basis(Aksp.solve, V, V[-nb:], 0, L, H)
+        extend_basis(Asolve, V, V[-nb:], 0, L, H)
 
         for i in range(m_krylov):
             # New basis vectors (obtained by mult by A then A^-1)
-            extend_basis(Amat.mult, V, V[-nb:], 2*i+1, H, L)
-            extend_basis(Aksp.solve, V, V[-nb:], 2*i+2, L, H)
+            extend_basis(Amult, V, V[-nb:], 2*i+1, H, L)
+            extend_basis(Asolve, V, V[-nb:], 2*i+2, L, H)
 
             # Solve projected problem
             nvec = (2*i+2)*nb
@@ -615,6 +644,11 @@ class SylvesterEKSP:
         viewer.pushASCIITab()
         self.Aksp.view(viewer)
         viewer.popASCIITab()
+        viewer.printfASCII(
+            "The KSP for solving M is:\n")
+        viewer.pushASCIITab()
+        self.Mksp.view(viewer)
+        viewer.popASCIITab()
 
     def _convergence_test(self, ksp, it, rnorm):
         if it == 0:
@@ -640,6 +674,14 @@ class SylvesterEKSP:
 
 
 class IRKKroneckerPC(petsctools.PCBase):
+    """
+    PETSc Options
+    -------------
+
+    -pc_irkkron_shift_type (none|diag|eigmin) : default eigmin
+    -pc_irkkron_shift_amount float : only for shift_type diag
+    -irk_kron_ ... : options for kronecker ksp
+    """
     prefix = "irkkron_"
 
     def initialize(self, pc):
@@ -668,10 +710,14 @@ class IRKKroneckerPC(petsctools.PCBase):
 
         Mform = derivative(
             replace(split_form.time, {Dt(stepper.u0): stepper.u0}), stepper.u0)
-        M = get_assembler(Mform, bcs=stage_bcs, mat_type="aij",
-            options_prefix=f"{pc_prefix}M_").assemble().petscmat
-        M.convert(PETSc.Mat.Type.DENSE)
-        assert np.allclose(np.eye(V.dim()), M.getDenseArray())
+        M_assembler = get_assembler(Mform, bcs=stage_bcs, mat_type="aij",
+            options_prefix=f"{pc_prefix}M_")
+        self.M = M_assembler.allocate()
+        self._assemble_M = M_assembler.assemble
+        self._assemble_M(tensor=self.M)
+        # self.M.convert(PETSc.Mat.Type.DENSE)
+        # assert np.allclose(np.eye(V.dim()), M.getDenseArray())
+        # M.convert(PETSc.Mat.Type.AIJ)
 
         Kform = derivative(split_form.remainder, stepper.u0)
 
@@ -696,6 +742,10 @@ class IRKKroneckerPC(petsctools.PCBase):
             shift = np.min(np.linalg.eigvals(Ainv_array).real)
         else:
             shift = 0
+        self.shift_type = shift_type
+        self.shift = shift
+
+        print(f"{shift= }")
 
         if shift != 0:
             Ainv_array -= shift*np.eye(butcher.num_stages)
@@ -726,7 +776,8 @@ class IRKKroneckerPC(petsctools.PCBase):
 
         kronmat = PETSc.Mat().createPython(
             size=full_size,
-            context=KroneckerProductMat(self.K.petscmat, Ainv),
+            context=KroneckerProductMat(
+                self.K.petscmat, Ainv, self.M.petscmat),
             comm=pc.comm,
         )
 
@@ -764,13 +815,25 @@ class IRKKroneckerPC(petsctools.PCBase):
         self.kronksp = kronksp
 
     def update(self, pc):
+        self._assemble_M(tensor=self.M)
         self._assemble_K(tensor=self.K)
 
     def apply(self, pc, x, y):
         w = y.duplicate()
         self.kron_a1inv.mult(x, w)
         self.kronksp.solve(w, y)
-        # self.kronksp.solve(x, y)
 
-    # def view(self, pc, viewer=None):
-    #     pass
+    def view(self, pc, viewer=None):
+        if viewer is None:
+            return
+        if viewer.type != PETSc.Viewer.Type.ASCII:
+            return
+        viewer.printfASCII(
+            "Preconditioner to solve the Kronecker product Jacobian (IxM + AxK).\n")
+        viewer.printfASCII(
+            f"Shift type: {self.shift_type}, shift amount: {self.shift}.\n")
+        viewer.printfASCII(
+            "The KSP for solving the Kronecker product Jacobian is:\n")
+        viewer.pushASCIITab()
+        self.kronksp.view(viewer)
+        viewer.popASCIITab()

@@ -135,7 +135,7 @@ petsctools.set_from_options(
         "ksp_type": "python",
         "ksp_python_type": "eksm.SylvesterEKSP",
         "ksp_sylvester_adaptive_tol": adaptive_tol,
-        "sylvester": block_params,
+        "sylvester_A": block_params,
     }
 )
 bfull = kronmat.getPythonContext().vec_nest.duplicate()
