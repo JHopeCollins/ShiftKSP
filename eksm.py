@@ -675,10 +675,15 @@ class IRKKroneckerPC(petsctools.PCBase):
 
         Kform = derivative(split_form.remainder, stepper.u0)
 
+        dt_f = float(stepper.dt)
+        A1, A2 = stepper.splitting(butcher.A)
+        A = dt_f*butcher.A
+        Ainv_array = np.linalg.inv(A)
+
         shift_options = PETSc.Options(pc_prefix + "shift_")
 
         shift_type = shift_options.getString("type", "none")
-        valid_shift_types = ("none", "diag")#, "eigmin")
+        valid_shift_types = ("none", "diag", "eigmin")
         if shift_type not in valid_shift_types:
             raise ValueError(
                 f"{pc_prefix}shift_type must be one of"
@@ -686,15 +691,15 @@ class IRKKroneckerPC(petsctools.PCBase):
             )
 
         if shift_type == "diag":
-            shift_type = shift_options.getScalar(
-                f"{pc_prefix}shift_amount", 1.0)
+            shift = shift_options.getScalar("amount", 1.0)
         elif shift_type == "eigmin":
-            raise NotImplementedError
+            shift = np.min(np.linalg.eigvals(Ainv_array).real)
+        else:
+            shift = 0
 
-        A1, A2 = stepper.splitting(butcher.A)
-        dt_f = float(stepper.dt)
-
-        A = dt_f*butcher.A
+        if shift != 0:
+            Ainv_array += shift*np.eye(butcher.num_stages)
+            Kform -= shift*Mform
 
         # K_assembler = get_assembler(
         #     Kform, bcs=stage_bcs, form_compiler_parameters=ctx.fcp,
@@ -713,7 +718,7 @@ class IRKKroneckerPC(petsctools.PCBase):
 
         Ainv = PETSc.Mat().createDense(
             size=(A.shape, A.shape),
-            array=np.linalg.inv(dt_f*A),
+            array=Ainv_array,
         )
         Ainv.convert(PETSc.Mat.Type.AIJ)
 
