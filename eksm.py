@@ -7,6 +7,19 @@ Print = PETSc.Sys.Print
 __all__ = ["OrthonormalBasis", "eksm", "KroneckerProductMat"]
 
 
+def matfree2dense(mat):
+    array = np.zeros(mat.sizes[0])
+    x, y = mat.createVecs()
+    for i in range(array.shape[0]):
+        x.array[:] = 0
+        x.array[i] = 1
+        mat.mult(x, y)
+        array[:, i] = y.array_r
+    dense = PETSc.Mat().createDense(
+        size=mat.sizes, array=array)
+    return dense
+
+
 def vecs2numpy(vecs, arr=None):
     if arr is None:
         arr = np.zeros((vecs[0].size, len(vecs)))
@@ -149,7 +162,7 @@ class KroneckerProductMat:
         self.S = S
 
         if d is None:
-            sinv.createVecRight()
+            d = S.createVecRight()
             d.array[:] = 1
         self.d = d
 
@@ -157,11 +170,21 @@ class KroneckerProductMat:
         self.Sa = S.getDenseArray(readonly=True).copy()
         self.S.convert(PETSc.Mat.Type.AIJ)
 
+        sub_vecs = []
+        for _ in range(S.sizes[0][0]):
+            v = A.createVecRight()
+            v.setUp()
+            v.assemble()
+            sub_vecs.append(v)
+
         self.vec_nest = PETSc.Vec().createNest(
-            vecs=[A.createVecRight()
-                  for _ in range(S.sizes[0][0])],
+            # vecs=[A.createVecRight()
+            #       for _ in range(S.sizes[0][0])],
+            vecs=sub_vecs,
             comm=A.comm
         )
+        self.vec_nest.setUp()
+        self.vec_nest.assemble()
 
     def mult(self, mat, x, y):
         xn = self.vec_nest.duplicate()
@@ -181,10 +204,13 @@ class KroneckerProductMat:
             self.A.mult(xi, w)
             yi += w
             for j in range(Sa.shape[1]):
-                yi += float(Sa[j, i])*xsubs[j]
+                yi.axpy(float(Sa[i, j]), xsubs[j])
 
         yn.setNestSubVecs(ysubs)
-        yn.copy(result=y)
+        PETSc.Vec.concatenate(ysubs)[0].copy(result=y)
+
+    # def view(self, mat, viewer=None):
+    #     pass
 
 
 def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_tol=False, xvec=None):
@@ -204,7 +230,7 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
 
     # extract dense numpy array for S
     smat.convert(PETSc.Mat.Type.DENSE)
-    S = smat.getDenseArray(readonly=True).copy()
+    S = smat.getDenseArray(readonly=True).copy().T
     smat.convert(PETSc.Mat.Type.AIJ)
 
     darr = kron.d.array_r
@@ -335,7 +361,7 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov=None, rtol=None, xvec=None, kronksp
 
     # extract dense numpy array for S
     smat.convert(PETSc.Mat.Type.DENSE)
-    S = smat.getDenseArray(readonly=True).copy()
+    S = smat.getDenseArray(readonly=True).copy().T
     smat.convert(PETSc.Mat.Type.AIJ)
 
     # Set Extended Krylov space quantities
@@ -495,7 +521,7 @@ class SylvesterEKSP:
 
         # extract dense numpy array for S
         Smat.convert(PETSc.Mat.Type.DENSE)
-        S = Smat.getDenseArray(readonly=True).copy()
+        S = Smat.getDenseArray(readonly=True).copy().T
         Smat.convert(PETSc.Mat.Type.AIJ)
 
         bs = bnest.getNestSubVecs()
@@ -568,7 +594,7 @@ class SylvesterEKSP:
         for i, xi in enumerate(xs):
             dmult(self._V, self._y[:,i], result=xi)
         self.xnest.setNestSubVecs(xs)
-        self.xnest.copy(result=x)
+        PETSc.Vec.concatenate(xs)[0].copy(result=x)
 
     def view(self, ksp, viewer=None):
         if viewer is None:
@@ -611,3 +637,135 @@ class SylvesterEKSP:
         elif rnorm/self._rnorm0 > ksp.divtol:
             ksp.setConvergedReason(
                 PETSc.KSP.ConvergedReason.DIVERGED_DTOL)
+
+
+class IRKKroneckerPC(petsctools.PCBase):
+    prefix = "irkkron_"
+
+    def initialize(self, pc):
+        # from firedrake import derivative, replace
+        from firedrake import derivative, replace, TrialFunction
+        from firedrake.assemble import get_assembler
+        from firedrake.dmhooks import get_appctx as get_snesctx
+        from irksome import Dt
+        from irksome.ufl.manipulation import split_time_derivative_terms
+
+        ctx = get_snesctx(pc.getDM())
+        stepper = ctx.appctx["stepper"]
+
+        outer_prefix = pc.getOptionsPrefix() or ''
+        prefix = f"{outer_prefix}{self.prefix}"
+        pc_prefix = f"{outer_prefix}pc_{self.prefix}"
+
+        V = stepper.u0.function_space()
+
+        stage_bcs = stepper.orig_bcs
+        butcher = stepper.butcher_tableau
+
+        split_form = split_time_derivative_terms(
+            stepper.F, stepper.t, timedep_coeffs=(stepper.u0,)
+        )
+
+        Mform = derivative(
+            replace(split_form.time, {Dt(stepper.u0): stepper.u0}), stepper.u0)
+        M = get_assembler(Mform, bcs=stage_bcs, mat_type="aij",
+            options_prefix=f"{pc_prefix}M_").assemble().petscmat
+        M.convert(PETSc.Mat.Type.DENSE)
+        assert np.allclose(np.eye(V.dim()), M.getDenseArray())
+
+        Kform = derivative(split_form.remainder, stepper.u0)
+
+        shift_options = PETSc.Options(pc_prefix + "shift_")
+
+        shift_type = shift_options.getString("type", "none")
+        valid_shift_types = ("none", "diag")#, "eigmin")
+        if shift_type not in valid_shift_types:
+            raise ValueError(
+                f"{pc_prefix}shift_type must be one of"
+                f" {valid_shift_types}, not {shift_type}."
+            )
+
+        if shift_type == "diag":
+            shift_type = shift_options.getScalar(
+                f"{pc_prefix}shift_amount", 1.0)
+        elif shift_type == "eigmin":
+            raise NotImplementedError
+
+        A1, A2 = stepper.splitting(butcher.A)
+        dt_f = float(stepper.dt)
+
+        A = dt_f*butcher.A
+
+        # K_assembler = get_assembler(
+        #     Kform, bcs=stage_bcs, form_compiler_parameters=ctx.fcp,
+        #     mat_type=ctx.mat_type, sub_mat_type=ctx.sub_mat_type,
+        #     options_prefix=prefix, appctx=ctx.appctx
+        # )
+        K_assembler = get_assembler(
+            Kform, bcs=stage_bcs, mat_type="aij",
+            options_prefix=f"{pc_prefix}K_")
+        self.K = K_assembler.allocate()
+        self._assemble_K = K_assembler.assemble
+        self._assemble_K(tensor=self.K)
+        # K is defined over a single stage so needs
+        # the DM for a single stage.
+        # self.K.petscmat.setDM(stepper.u0.function_space().dm)
+
+        Ainv = PETSc.Mat().createDense(
+            size=(A.shape, A.shape),
+            array=np.linalg.inv(dt_f*A),
+        )
+        Ainv.convert(PETSc.Mat.Type.AIJ)
+
+        full_size = pc.getOperators()[0].sizes
+
+        kronmat = PETSc.Mat().createPython(
+            size=full_size,
+            context=KroneckerProductMat(self.K.petscmat, Ainv),
+            comm=pc.comm,
+        )
+
+        # IRK builds IxM + AxK but for sylvester we need
+        # (A^-1)xM + IxK, so premultiply with (A^-1)xI
+        A1inv = PETSc.Mat().createDense(
+            size=(A.shape, A.shape),
+            array=np.linalg.inv(dt_f*A1),
+        )
+        A1inv.convert(PETSc.Mat.Type.AIJ)
+        zero_mat = PETSc.Mat().createConstantDiagonal(
+            size=self.K.petscmat.sizes,
+            diag=0., comm=pc.comm)
+        self.kron_a1inv = PETSc.Mat().createPython(
+            size=full_size,
+            context=KroneckerProductMat(zero_mat, A1inv),
+            comm=pc.comm,
+        )
+
+        kronksp = PETSc.KSP().create(comm=pc.comm)
+        # This KSP is over the monolithic space so we
+        # need the monolithic DM, but we are providing
+        # the operators manually so deactivate the dm.
+        # kronksp.setDM(pc.getDM())
+        # kronksp.setDMActive(PETSc.KSP.DMActive.ALL, False)
+        # Now we can finish setting up the KSP
+        kronksp.setOperators(kronmat)
+        kronksp.setOptionsPrefix(prefix)
+        # default to looking like a pc
+        kronksp.setType(PETSc.KSP.Type.PREONLY)
+        kronksp.setFromOptions()
+
+        kronksp.incrementTabLevel(1, parent=pc)
+        kronksp.pc.incrementTabLevel(1, parent=pc)
+        self.kronksp = kronksp
+
+    def update(self, pc):
+        self._assemble_K(tensor=self.K)
+
+    def apply(self, pc, x, y):
+        w = y.duplicate()
+        self.kron_a1inv.mult(x, w)
+        self.kronksp.solve(w, y)
+        # self.kronksp.solve(x, y)
+
+    # def view(self, pc, viewer=None):
+    #     pass

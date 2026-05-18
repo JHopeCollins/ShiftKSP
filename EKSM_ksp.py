@@ -80,10 +80,9 @@ d.array[:] = np.random.random_sample(p)
 
 kronmat = PETSc.Mat().createPython(
     size=((n*p, n*p), (n*p, n*p)),
-    context=KroneckerProductMat(amat, sinv, d),
+    context=KroneckerProductMat(
+        amat, sinv.copy().transpose(), d),
 )
-kronmat.setUp()
-kronmat.assemble()
 
 X = eksm(kronmat, Aksp, b, m_krylov=m_krylov,
          atol=atol, adaptive_tol=adaptive_tol)
