@@ -7,7 +7,7 @@ Print = PETSc.Sys.Print
 __all__ = ["OrthonormalBasis", "eksm", "KroneckerProductMat"]
 
 
-def matfree2dense(mat):
+def matfree2dense(mat, comm=None):
     array = np.zeros(mat.sizes[0])
     x, y = mat.createVecs()
     for i in range(array.shape[0]):
@@ -16,7 +16,7 @@ def matfree2dense(mat):
         mat.mult(x, y)
         array[:, i] = y.array_r
     dense = PETSc.Mat().createDense(
-        size=mat.sizes, array=array)
+        size=mat.sizes, array=array, comm=comm)
     return dense
 
 
@@ -39,6 +39,17 @@ def numpy2vecnest(vec, arr):
     numpy2vecs(subvecs, arr)
     vec.setNestSubVecs(subvecs)
     return vec
+
+
+def interleave(xsubs, x):
+    # TODO: petsc-ify this to avoid numpy operations
+    x.zeroEntries()
+    off = 0
+    for xs in xsubs:
+        ns = xs.array_r.shape[0]
+        x.array[off:off+ns] = xs.array_r
+        off += ns
+    return x
 
 
 def mdot(x, y):
@@ -168,16 +179,17 @@ class KroneckerProductMat:
             d.array[:] = 1
         self.d = d
 
-        self.S.convert(PETSc.Mat.Type.DENSE)
+        Stype = S.type
+        S.convert(PETSc.Mat.Type.DENSE)
         self.Sa = S.getDenseArray(readonly=True).copy()
-        self.S.convert(PETSc.Mat.Type.AIJ)
+        S.convert(Stype)
 
         self.M = M or PETSc.Mat().createConstantDiagonal(
             size=A.sizes, diag=1.0, comm=A.comm)
 
         self.vec_nest = PETSc.Vec().createNest(
             vecs=[A.createVecRight()
-                  for _ in range(S.sizes[0][0])],
+                  for _ in range(S.size[0])],
             comm=A.comm
         )
         self.vec_nest.setUp()
@@ -207,8 +219,7 @@ class KroneckerProductMat:
             for j in range(Sa.shape[1]):
                 ysubs[i].axpy(float(Sa[i, j]), Mxs[j])
 
-        yn.setNestSubVecs(ysubs)
-        PETSc.Vec.concatenate(ysubs)[0].copy(result=y)
+        interleave(ysubs, y)
 
     # def view(self, mat, viewer=None):
     #     pass
@@ -230,9 +241,10 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
     p = smat.size[0]
 
     # extract dense numpy array for S
+    stype = smat.type
     smat.convert(PETSc.Mat.Type.DENSE)
     S = smat.getDenseArray(readonly=True).copy().T
-    smat.convert(PETSc.Mat.Type.AIJ)
+    smat.convert(stype)
 
     darr = kron.d.array_r
 
@@ -248,7 +260,7 @@ def eksm(kronmat, Aksp, b, *, kronksp=None, m_krylov=None, atol=None, adaptive_t
     w = b.copy()
     w /= beta
 
-    V = OrthonormalBasis(w)
+    V = OrthonormalBasis(w, comm=A.comm)
 
     # New vector (multiply previous one by A then orthogonalise)
     with petsctools.inserted_options(Aksp):
@@ -361,9 +373,10 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov=None, rtol=None, xvec=None, kronksp
     #     "an array d so that we are solving AX+XS = b d^T")
 
     # extract dense numpy array for S
+    stype = smat.type
     smat.convert(PETSc.Mat.Type.DENSE)
     S = smat.getDenseArray(readonly=True).copy().T
-    smat.convert(PETSc.Mat.Type.AIJ)
+    smat.convert(stype)
 
     # Set Extended Krylov space quantities
     X = np.zeros((n,p)) # solution matrix
@@ -378,7 +391,7 @@ def block_eksm(kronmat, Aksp, b, d, m_krylov=None, rtol=None, xvec=None, kronksp
     w = b[0].copy()
     w /= beta
 
-    V = OrthonormalBasis(w)
+    V = OrthonormalBasis(w, comm=amat.comm)
     for j in range(1, bs):
         _, normwp, h = V.append(b[j])
         c[0:j,j] = h
@@ -501,13 +514,13 @@ class SylvesterEKSP:
 
         prefix = ksp.getOptionsPrefix() or ''
 
-        self.Aksp = PETSc.KSP().create()
+        self.Aksp = PETSc.KSP().create(comm=ksp.comm)
         self.Aksp.setOperators(kron.A)
         self.Aksp.setOptionsPrefix(prefix + self.prefix + "A_")
         self.Aksp.setFromOptions()
         self.Aksp.incrementTabLevel(1, parent=ksp)
 
-        self.Mksp = PETSc.KSP().create()
+        self.Mksp = PETSc.KSP().create(comm=ksp.comm)
         self.Mksp.setOperators(kron.M)
         self.Mksp.setOptionsPrefix(prefix + self.prefix + "M_")
         self.Mksp.setFromOptions()
@@ -533,9 +546,10 @@ class SylvesterEKSP:
             Aksp_rtol0 = Aksp.rtol
 
         # extract dense numpy array for S
+        stype = Smat.type
         Smat.convert(PETSc.Mat.Type.DENSE)
         S = Smat.getDenseArray(readonly=True).copy().T
-        Smat.convert(PETSc.Mat.Type.AIJ)
+        Smat.convert(stype)
 
         wnest = bnest.duplicate()
         b.copy(result=wnest)
@@ -562,7 +576,7 @@ class SylvesterEKSP:
         ksp.its = 0
         ksp.setConvergedReason(PETSc.KSP.ConvergedReason.ITERATING)
 
-        V = OrthonormalBasis()
+        V = OrthonormalBasis(comm=ksp.comm)
         self._V = V
         w = Amat.createVecRight()
 
@@ -622,8 +636,7 @@ class SylvesterEKSP:
         xs = self.xnest.getNestSubVecs()
         for i, xi in enumerate(xs):
             dmult(self._V, self._y[:,i], result=xi)
-        self.xnest.setNestSubVecs(xs)
-        PETSc.Vec.concatenate(xs)[0].copy(result=x)
+        interleave(xs, x)
 
     def view(self, ksp, viewer=None):
         if viewer is None:
@@ -685,8 +698,8 @@ class IRKKroneckerPC(petsctools.PCBase):
     prefix = "irkkron_"
 
     def initialize(self, pc):
-        # from firedrake import derivative, replace
-        from firedrake import derivative, replace, TrialFunction
+        from firedrake import (
+            derivative, replace, TrialFunction, Constant)
         from firedrake.assemble import get_assembler
         from firedrake.dmhooks import get_appctx as get_snesctx
         from irksome import Dt
@@ -715,9 +728,6 @@ class IRKKroneckerPC(petsctools.PCBase):
         self.M = M_assembler.allocate()
         self._assemble_M = M_assembler.assemble
         self._assemble_M(tensor=self.M)
-        # self.M.convert(PETSc.Mat.Type.DENSE)
-        # assert np.allclose(np.eye(V.dim()), M.getDenseArray())
-        # M.convert(PETSc.Mat.Type.AIJ)
 
         Kform = derivative(split_form.remainder, stepper.u0)
 
@@ -745,11 +755,11 @@ class IRKKroneckerPC(petsctools.PCBase):
         self.shift_type = shift_type
         self.shift = shift
 
-        print(f"{shift= }")
+        PETSc.Sys.Print(f"{shift= }")
 
         if shift != 0:
             Ainv_array -= shift*np.eye(butcher.num_stages)
-            Kform += shift*Mform
+            Kform += Constant(shift)*Mform
 
         # K_assembler = get_assembler(
         #     Kform, bcs=stage_bcs, form_compiler_parameters=ctx.fcp,
@@ -769,6 +779,7 @@ class IRKKroneckerPC(petsctools.PCBase):
         Ainv = PETSc.Mat().createDense(
             size=(A.shape, A.shape),
             array=Ainv_array,
+            comm=PETSc.COMM_SELF,
         )
         Ainv.convert(PETSc.Mat.Type.AIJ)
 
@@ -786,6 +797,7 @@ class IRKKroneckerPC(petsctools.PCBase):
         A1inv = PETSc.Mat().createDense(
             size=(A.shape, A.shape),
             array=np.linalg.inv(dt_f*A1),
+            comm=PETSc.COMM_SELF,
         )
         A1inv.convert(PETSc.Mat.Type.AIJ)
         zero_mat = PETSc.Mat().createConstantDiagonal(
