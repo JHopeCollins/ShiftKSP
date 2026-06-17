@@ -1,3 +1,4 @@
+from sys import exit
 import numpy as np
 from firedrake import *
 from irksome import Dt, TimeStepper, RadauIIA, GaussLegendre
@@ -23,19 +24,26 @@ if equation_type == "advection":
     v = TestFunction(V)
     
     ubar = options.getReal("ubar", 1.0)
-    u = as_vector([Constant(ubar)])
+    assert ubar >= 0, "inflow on left of domain"
+    u = as_vector([Constant(ubar) + 0.25*cos(2*pi*x)])
     
     n = FacetNormal(mesh)
     un = Constant(0.5)*(dot(u, n) + abs(dot(u, n)))
     
     flux = (un*q)('+') - (un*q)('-')
+
+    q_in = Constant(1)
+    flux_in = dot(u, n)*q_in
     
     F = (
         inner(Dt(q), v)*dx
-        + q*div(v*u)*dx
+        - q*div(v*u)*dx
         + (v('+')*flux - v('-')*flux)*dS
+        + v*flux_in*ds(1)
     )
-    
+
+    bcs = []
+
     dt = cfl*h/ubar
 
     K_ksp_type = 'gmres'
@@ -57,15 +65,18 @@ elif equation_type == "diffusion":
 
     dt = cfl*h*h/nubar
 
+    bcs = [DirichletBC(V, 1, 1)]
+
     K_ksp_type = 'cg'
 
 else:
     raise ValueError("Unrecognised {equation_type = }")
 
+Print(f"{V.dim()= } . {dt= :.2e}")
 dt = Constant(dt)
 t = Constant(0)
     
-q.interpolate(sin(2*pi*x))
+q.interpolate(cos(2*pi*x))
 
 num_stages = options.getInt("irk_num_stages", 2)
 tableau = {
@@ -91,6 +102,7 @@ eksm_parameters = {
     'pc_type': 'python',
     'pc_python_type': 'eksm.IRKKroneckerPC',
     'pc_irkkron_shift_type': 'eigmin',
+    'pc_irkkron_shift_amount': float(1/dt),  # only for -shift_type diag
     'irkkron': {
         "ksp_converged_rate": None,
         "ksp_monitor": None,
@@ -105,26 +117,26 @@ eksm_parameters = {
         # solve the sylvester equation
         "ksp_type": "python",
         "ksp_python_type": "eksm.SylvesterEKSP",
-        "ksp_sylvester_adaptive_tol": "yes",
+        # "ksp_sylvester_adaptive_tol": "no",
         "sylvester_A": {
-            'ksp_rtol': 1e-5,
-            'ksp_type': K_ksp_type,
-            'pc_type': 'jacobi',
+            'ksp_type': 'preonly',
+            'pc_type': 'lu',
         },
         "sylvester_M": {
             'ksp_type': 'preonly',
             'pc_type': 'cholesky',
+            'ksp_reuse_preconditioner': None,
         },
     },
 }
 
 parameters = eksm_parameters
 
-from irksome.tools import IA, AI
 stepper = TimeStepper(
-    F, tableau, t, dt, q,
-    splitting=AI,
+    F, tableau, t, dt, q, bcs=bcs,
     solver_parameters=parameters,
     options_prefix="")
 
+for i, usub in enumerate(stepper.stages.subfunctions):
+    usub.interpolate(sin((i+2)*2*pi*x))
 stepper.advance()
